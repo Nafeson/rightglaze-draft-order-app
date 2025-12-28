@@ -2,48 +2,65 @@ import express from "express";
 import crypto from "crypto";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
 
-/**
-* ENV you must set:
-* - SHOPIFY_SHOP: yourshop.myshopify.com
-* - SHOPIFY_ADMIN_TOKEN: Admin API access token from the custom app
-* - SHOPIFY_API_SECRET: App secret key (used to validate App Proxy signature)
-* - SHOPIFY_API_VERSION: e.g. 2025-10 (or current stable)
-* - PRESENTMENT_CURRENCY: GBP
-* - PORT: (Render sets this automatically)
-*/
+// Capture raw body for signature verification
+app.use(express.json({
+limit: "1mb",
+verify: (req, res, buf) => { req.rawBody = buf; }
+}));
+
 const {
 SHOPIFY_SHOP,
 SHOPIFY_ADMIN_TOKEN,
-SHOPIFY_API_SECRET,
+SHOPIFY_API_SECRET, // still used by your other code; fine to keep
 SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
-PORT = 3000
+PORT = 3000,
+
+// ✅ New (you already set these in Render)
+ALLOWED_ORIGIN,
+FRONTEND_SHARED_SECRET
 } = process.env;
 
 if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN || !SHOPIFY_API_SECRET) {
 console.error("Missing env. Need SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN, SHOPIFY_API_SECRET.");
 process.exit(1);
 }
+if (!ALLOWED_ORIGIN || !FRONTEND_SHARED_SECRET) {
+console.error("Missing env. Need ALLOWED_ORIGIN, FRONTEND_SHARED_SECRET.");
+process.exit(1);
+}
+
+/* =========================
+CORS (allow only your site)
+========================= */
+function setCors(res, origin) {
+res.setHeader("Access-Control-Allow-Origin", origin);
+res.setHeader("Vary", "Origin");
+res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-RG-Timestamp,X-RG-Signature");
+}
+
+app.options("/checkout", (req, res) => {
+const origin = req.headers.origin || "";
+if (origin === ALLOWED_ORIGIN) setCors(res, origin);
+return res.status(204).end();
+});
 
 /* =========================
 PRICING (INC VAT)
-- Mirrors your current Stage 1 logic
 ========================= */
 
 const PRICING = {
-BASE_RATE: 150, // £/m²
-MIN_PRICE: 72.07, // minimum charge
-MM_FACTOR: 0.002 // £ per (w+h) mm
+BASE_RATE: 150,
+MIN_PRICE: 72.07,
+MM_FACTOR: 0.002
 };
 
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
-
 if (!Number.isFinite(widthMm) || !Number.isFinite(heightMm) || widthMm <= 0 || heightMm <= 0) return 0;
 
-// Stage 1 pricing only for this config:
 if (outerGlass === "4mm Clear" && innerGlass === "4mm Clear" && selfCleaning === "No") {
 const areaM2 = (widthMm * heightMm) / 1_000_000;
 const areaCost = areaM2 * PRICING.BASE_RATE;
@@ -51,8 +68,7 @@ const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
 return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj;
 }
 
-// Unpriced until you add more stages:
-return 0;
+return 0; // unpriced until more stages added
 }
 
 /* =========================
@@ -82,29 +98,23 @@ const h = Number(raw.heightMm);
 const { w: cw, h: ch } = clampDims(w, h);
 
 const unit = {
-qty: Number(raw.qty) || 1,
+qty: Math.min(10, Math.max(1, Number(raw.qty) || 1)),
 outerGlass: String(raw.outerGlass || ""),
 innerGlass: String(raw.innerGlass || ""),
 cavityWidth: String(raw.cavityWidth || ""),
 selfCleaning: String(raw.selfCleaning || "No"),
 spacer: String(raw.spacer || ""),
 widthMm: cw,
-heightMm: ch
+heightMm: ch,
+toughened: "Yes"
 };
-
-unit.qty = Math.min(10, Math.max(1, unit.qty));
-unit.toughened = "Yes"; // forced yes-only
 
 return applyAreaRule(unit);
 }
 
 /* =========================
-APP PROXY SIGNATURE VALIDATION
-Shopify app proxy provides `signature` param and expects:
-- remove signature
-- split on '&', parse
-- sort, concatenate (no delimiter)
-- HMAC-SHA256 hex with shared secret
+SIGNATURE VERIFICATION (HMAC)
+signature = HMAC_SHA256(secret, `${timestamp}.${rawBody}`)
 ========================= */
 
 function timingSafeEqualHex(a, b) {
@@ -114,28 +124,28 @@ if (ab.length !== bb.length) return false;
 return crypto.timingSafeEqual(ab, bb);
 }
 
-function validateAppProxySignature(query, secret) {
-const signature = query.signature;
-if (!signature || typeof signature !== "string") return false;
+function verifyFrontendSignature(req) {
+const ts = String(req.headers["x-rg-timestamp"] || "");
+const sig = String(req.headers["x-rg-signature"] || "");
 
-const entries = [];
-for (const [k, v] of Object.entries(query)) {
-if (k === "signature") continue;
-if (Array.isArray(v)) entries.push([k, v.join(",")]);
-else entries.push([k, String(v)]);
-}
+if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
 
-const sorted = entries
-.map(([k, v]) => `${k}=${v}`)
-.sort()
-.join("");
+// prevent replay: require timestamp within 5 minutes
+const tsNum = Number(ts);
+if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
+const skewMs = Math.abs(Date.now() - tsNum);
+if (skewMs > 5 * 60 * 1000) return { ok: false, reason: "Timestamp too old/new" };
 
-const digest = crypto.createHmac("sha256", secret).update(sorted).digest("hex");
-return timingSafeEqualHex(signature, digest);
+const raw = req.rawBody ? req.rawBody.toString("utf8") : "";
+const payloadToSign = `${ts}.${raw}`;
+const digest = crypto.createHmac("sha256", FRONTEND_SHARED_SECRET).update(payloadToSign).digest("hex");
+
+if (!timingSafeEqualHex(sig, digest)) return { ok: false, reason: "Bad signature" };
+return { ok: true };
 }
 
 /* =========================
-SHOPIFY GRAPHQL CALL
+SHOPIFY GRAPHQL
 ========================= */
 
 async function shopifyGraphQL(query, variables) {
@@ -155,10 +165,6 @@ if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)
 if (json.errors?.length) throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
 }
-
-/* =========================
-FORMAT BREAKDOWN (customer-visible)
-========================= */
 
 function formatBreakdown(units, totals) {
 const lines = [];
@@ -190,32 +196,23 @@ return lines.join("\n");
 }
 
 /* =========================
-MAIN ENDPOINT (via App Proxy)
-Storefront will call:
-POST /apps/rightglaze/checkout
-which Shopify proxies to:
-POST https://YOUR-APP-HOST/proxy/checkout
+✅ DIRECT CHECKOUT ENDPOINT
 ========================= */
 
-app.post("/proxy/checkout", async (req, res) => {
+app.post("/checkout", async (req, res) => {
 try {
-// 1) Validate app proxy signature
-if (!validateAppProxySignature(req.query, SHOPIFY_API_SECRET)) {
-return res.status(401).json({ error: "Invalid proxy signature" });
-}
+const origin = req.headers.origin || "";
+if (origin !== ALLOWED_ORIGIN) return res.status(403).json({ error: "Origin not allowed" });
+setCors(res, origin);
 
-// 2) Ensure the shop param matches your store
-if (String(req.query.shop || "").toLowerCase() !== SHOPIFY_SHOP.toLowerCase()) {
-return res.status(403).json({ error: "Shop mismatch" });
-}
+const sigOk = verifyFrontendSignature(req);
+if (!sigOk.ok) return res.status(401).json({ error: "Unauthorized", reason: sigOk.reason });
 
-// 3) Validate payload
 const unitsRaw = req.body?.units;
 if (!Array.isArray(unitsRaw) || unitsRaw.length === 0) {
 return res.status(400).json({ error: "Missing units[]" });
 }
 
-// 4) Normalize + apply rules + calculate
 const units = unitsRaw.map(normalizeUnit);
 
 let grandTotal = 0;
@@ -225,7 +222,6 @@ u._unitPriceIncVat = unitPrice;
 grandTotal += unitPrice * u.qty;
 }
 
-// block checkout if everything is unpriced
 if (grandTotal <= 0) {
 return res.status(422).json({
 error: "This configuration is currently unpriced (total £0.00). Add more pricing stages before enabling checkout."
@@ -234,21 +230,11 @@ error: "This configuration is currently unpriced (total £0.00). Add more pricin
 
 const breakdown = formatBreakdown(units, { grandTotal });
 
-// 5) Create Draft Order with ONE combined custom line item
-// Use DraftOrderLineItemInput with title + priceOverride (presentment currency)
-// priceOverride is supported for custom pricing in drafts. [oai_citation:1‡Shopify](https://shopify.dev/docs/api/admin-graphql/latest/input-objects/draftorderlineiteminput)
 const mutation = `
 mutation draftOrderCreate($input: DraftOrderInput!) {
 draftOrderCreate(input: $input) {
-draftOrder {
-id
-invoiceUrl
-name
-}
-userErrors {
-field
-message
-}
+draftOrder { id invoiceUrl name }
+userErrors { field message }
 }
 }
 `;
@@ -263,12 +249,8 @@ title: "Bespoke Double Glazed Units (Custom Order)",
 quantity: 1,
 requiresShipping: true,
 taxable: true,
-priceOverride: {
-amount: Number(grandTotal.toFixed(2)),
-currencyCode: PRESENTMENT_CURRENCY
-},
+priceOverride: { amount: Number(grandTotal.toFixed(2)), currencyCode: PRESENTMENT_CURRENCY },
 customAttributes: [
-{ key: "RightGlaze Calculator", value: "Bespoke DG Units" },
 { key: "Units Count", value: String(units.length) },
 { key: "Grand Total (inc VAT)", value: `£${grandTotal.toFixed(2)}` }
 ]
@@ -281,21 +263,14 @@ const payload = data?.draftOrderCreate;
 
 if (!payload) throw new Error("No draftOrderCreate payload returned.");
 
-const errors = payload.userErrors || [];
-if (errors.length) {
-return res.status(400).json({ error: "Draft order error", details: errors });
+if (payload.userErrors?.length) {
+return res.status(400).json({ error: "Draft order error", details: payload.userErrors });
 }
 
 const invoiceUrl = payload.draftOrder?.invoiceUrl;
-if (!invoiceUrl) {
-return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
-}
+if (!invoiceUrl) return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
 
-// 6) Return invoiceUrl so storefront can redirect straight to payment
-return res.json({
-invoiceUrl,
-grandTotal: Number(grandTotal.toFixed(2))
-});
+return res.json({ invoiceUrl, grandTotal: Number(grandTotal.toFixed(2)) });
 } catch (err) {
 console.error(err);
 return res.status(500).json({ error: "Server error", message: err.message });
@@ -304,6 +279,4 @@ return res.status(500).json({ error: "Server error", message: err.message });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => {
-console.log(`RightGlaze draft order app listening on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`RightGlaze draft order app listening on port ${PORT}`));
