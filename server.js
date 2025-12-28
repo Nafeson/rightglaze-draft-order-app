@@ -16,12 +16,10 @@ req.rawBody = buf;
 const {
 SHOPIFY_SHOP,
 SHOPIFY_ADMIN_TOKEN,
-SHOPIFY_API_SECRET, // still used by your other code; fine to keep
+SHOPIFY_API_SECRET,
 SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
 PORT = 3000,
-
-// ✅ Set in Render
 ALLOWED_ORIGIN,
 FRONTEND_SHARED_SECRET,
 } = process.env;
@@ -66,9 +64,9 @@ MIN_PRICE: 72.07,
 MM_FACTOR: 0.002,
 };
 
-// Returns unit price INC VAT (matches your calculator Stage 1)
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
+
 if (
 !Number.isFinite(widthMm) ||
 !Number.isFinite(heightMm) ||
@@ -77,7 +75,6 @@ heightMm <= 0
 )
 return 0;
 
-// Stage 1 priced config
 if (
 outerGlass === "4mm Clear" &&
 innerGlass === "4mm Clear" &&
@@ -86,10 +83,10 @@ selfCleaning === "No"
 const areaM2 = (widthMm * heightMm) / 1_000_000;
 const areaCost = areaM2 * PRICING.BASE_RATE;
 const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
-return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj; // INC VAT
+return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj;
 }
 
-return 0; // unpriced until more stages added
+return 0;
 }
 
 /* =========================
@@ -162,7 +159,6 @@ const sig = String(req.headers["x-rg-signature"] || "");
 
 if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
 
-// prevent replay: require timestamp within 5 minutes
 const tsNum = Number(ts);
 if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
 const skewMs = Math.abs(Date.now() - tsNum);
@@ -198,8 +194,7 @@ body: JSON.stringify({ query, variables }),
 });
 
 const json = await res.json();
-if (!res.ok)
-throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
+if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
 if (json.errors?.length)
 throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
@@ -229,11 +224,8 @@ lines.push(`- Cavity: ${u.cavityWidth}`);
 lines.push(`- Toughened: Yes`);
 lines.push(`- Self-cleaning: ${u.selfCleaning}`);
 lines.push(`- Spacer: ${u.spacer}`);
-lines.push(
-`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`
-);
-if (u._areaUpgradeApplied)
-lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
+lines.push(`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`);
+if (u._areaUpgradeApplied) lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
 lines.push(`- Unit price: £${unitPrice.toFixed(2)} (inc VAT)`);
 if (u.qty >= 2) lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
 lines.push("");
@@ -273,7 +265,6 @@ u._unitPriceIncVat = unitPrice;
 grossTotal += unitPrice * u.qty;
 }
 
-// Round once at end
 grossTotal = Number(grossTotal.toFixed(2));
 
 if (grossTotal <= 0) {
@@ -284,11 +275,7 @@ error:
 }
 
 const vat = Number(vatPortionFromGross(grossTotal).toFixed(2));
-
-const totals = {
-gross: grossTotal,
-vat,
-};
+const totals = { gross: grossTotal, vat };
 
 const breakdown = formatBreakdown(units, totals);
 
@@ -301,7 +288,10 @@ userErrors { field message }
 }
 `;
 
-// ✅ IMPORTANT: send GROSS total as priceOverride so checkout total always matches
+// ✅ CRITICAL FIX:
+// Shopify MoneyInput.amount is a Decimal scalar — send as STRING, not number.
+const grossAmountStr = totals.gross.toFixed(2);
+
 const input = {
 note: breakdown,
 tags: ["rightglaze", "bespoke", "calculator"],
@@ -312,13 +302,20 @@ title: "Bespoke Double Glazed Units (Custom Order)",
 quantity: 1,
 requiresShipping: true,
 taxable: true,
-priceOverride: {
-amount: totals.gross,
+
+// Belt + braces: set both for a custom line item.
+originalUnitPriceWithCurrency: {
+amount: grossAmountStr,
 currencyCode: PRESENTMENT_CURRENCY,
 },
+priceOverride: {
+amount: grossAmountStr,
+currencyCode: PRESENTMENT_CURRENCY,
+},
+
 customAttributes: [
 { key: "Units Count", value: String(units.length) },
-{ key: "Order Total (inc VAT)", value: `£${totals.gross.toFixed(2)}` },
+{ key: "Order Total (inc VAT)", value: `£${grossAmountStr}` },
 { key: "VAT (20%)", value: `£${totals.vat.toFixed(2)}` },
 ],
 },
@@ -338,7 +335,6 @@ const invoiceUrl = payload.draftOrder?.invoiceUrl;
 if (!invoiceUrl)
 return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
 
-// ✅ return grossTotal so frontend can show correct number too
 return res.json({ invoiceUrl, grandTotal: totals.gross, vatAmount: totals.vat });
 } catch (err) {
 console.error(err);
@@ -348,6 +344,4 @@ return res.status(500).json({ error: "Server error", message: err.message });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () =>
-console.log(`RightGlaze draft order app listening on port ${PORT}`)
-);
+app.listen(PORT, () => console.log(`RightGlaze draft order app listening on port ${PORT}`));
