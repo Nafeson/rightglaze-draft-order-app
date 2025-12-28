@@ -20,8 +20,13 @@ SHOPIFY_API_SECRET,
 SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
 PORT = 3000,
+
+// ✅ Set in Render
 ALLOWED_ORIGIN,
 FRONTEND_SHARED_SECRET,
+
+// ✅ New: anchor product variant (for checkout image)
+ANCHOR_VARIANT_GID,
 } = process.env;
 
 if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN || !SHOPIFY_API_SECRET) {
@@ -32,6 +37,10 @@ process.exit(1);
 }
 if (!ALLOWED_ORIGIN || !FRONTEND_SHARED_SECRET) {
 console.error("Missing env. Need ALLOWED_ORIGIN, FRONTEND_SHARED_SECRET.");
+process.exit(1);
+}
+if (!ANCHOR_VARIANT_GID) {
+console.error("Missing env. Need ANCHOR_VARIANT_GID.");
 process.exit(1);
 }
 
@@ -64,6 +73,7 @@ MIN_PRICE: 72.07,
 MM_FACTOR: 0.002,
 };
 
+// Returns unit price INC VAT (matches your calculator Stage 1)
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
 
@@ -75,6 +85,7 @@ heightMm <= 0
 )
 return 0;
 
+// Stage 1 priced config
 if (
 outerGlass === "4mm Clear" &&
 innerGlass === "4mm Clear" &&
@@ -83,10 +94,10 @@ selfCleaning === "No"
 const areaM2 = (widthMm * heightMm) / 1_000_000;
 const areaCost = areaM2 * PRICING.BASE_RATE;
 const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
-return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj;
+return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj; // INC VAT
 }
 
-return 0;
+return 0; // unpriced until more stages added
 }
 
 /* =========================
@@ -159,6 +170,7 @@ const sig = String(req.headers["x-rg-signature"] || "");
 
 if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
 
+// prevent replay: require timestamp within 5 minutes
 const tsNum = Number(ts);
 if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
 const skewMs = Math.abs(Date.now() - tsNum);
@@ -194,7 +206,8 @@ body: JSON.stringify({ query, variables }),
 });
 
 const json = await res.json();
-if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
+if (!res.ok)
+throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
 if (json.errors?.length)
 throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
@@ -224,10 +237,14 @@ lines.push(`- Cavity: ${u.cavityWidth}`);
 lines.push(`- Toughened: Yes`);
 lines.push(`- Self-cleaning: ${u.selfCleaning}`);
 lines.push(`- Spacer: ${u.spacer}`);
-lines.push(`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`);
-if (u._areaUpgradeApplied) lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
+lines.push(
+`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`
+);
+if (u._areaUpgradeApplied)
+lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
 lines.push(`- Unit price: £${unitPrice.toFixed(2)} (inc VAT)`);
-if (u.qty >= 2) lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
+if (u.qty >= 2)
+lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
 lines.push("");
 });
 
@@ -288,8 +305,8 @@ userErrors { field message }
 }
 `;
 
-// ✅ CRITICAL FIX:
-// Shopify MoneyInput.amount is a Decimal scalar — send as STRING, not number.
+// ✅ CRITICAL:
+// MoneyInput.amount is a Decimal scalar — send as STRING.
 const grossAmountStr = totals.gross.toFixed(2);
 
 const input = {
@@ -298,12 +315,14 @@ tags: ["rightglaze", "bespoke", "calculator"],
 presentmentCurrencyCode: PRESENTMENT_CURRENCY,
 lineItems: [
 {
-title: "Bespoke Double Glazed Units (Custom Order)",
+// ✅ Anchor to a real variant so checkout shows the product image
+variantId: ANCHOR_VARIANT_GID,
+
 quantity: 1,
 requiresShipping: true,
 taxable: true,
 
-// Belt + braces: set both for a custom line item.
+// Belt + braces: set both
 originalUnitPriceWithCurrency: {
 amount: grossAmountStr,
 currencyCode: PRESENTMENT_CURRENCY,
@@ -335,7 +354,11 @@ const invoiceUrl = payload.draftOrder?.invoiceUrl;
 if (!invoiceUrl)
 return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
 
-return res.json({ invoiceUrl, grandTotal: totals.gross, vatAmount: totals.vat });
+return res.json({
+invoiceUrl,
+grandTotal: totals.gross,
+vatAmount: totals.vat,
+});
 } catch (err) {
 console.error(err);
 return res.status(500).json({ error: "Server error", message: err.message });
@@ -344,4 +367,6 @@ return res.status(500).json({ error: "Server error", message: err.message });
 
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-app.listen(PORT, () => console.log(`RightGlaze draft order app listening on port ${PORT}`));
+app.listen(PORT, () =>
+console.log(`RightGlaze draft order app listening on port ${PORT}`)
+);
