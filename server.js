@@ -3,226 +3,378 @@ import crypto from "crypto";
 
 const app = express();
 
-/* =========================
-CAPTURE RAW BODY FOR HMAC
-========================= */
-app.use(express.json({
+// Capture raw body for signature verification
+app.use(
+express.json({
 limit: "1mb",
-verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+verify: (req, res, buf) => {
+req.rawBody = buf;
+},
+})
+);
 
 const {
 SHOPIFY_SHOP,
 SHOPIFY_ADMIN_TOKEN,
-SHOPIFY_API_SECRET,
+SHOPIFY_API_SECRET, // still used by your other code; fine to keep
 SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
 PORT = 3000,
+
+// ✅ New (you already set these in Render)
 ALLOWED_ORIGIN,
-FRONTEND_SHARED_SECRET
+FRONTEND_SHARED_SECRET,
 } = process.env;
 
 if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN || !SHOPIFY_API_SECRET) {
-console.error("Missing Shopify credentials");
+console.error(
+"Missing env. Need SHOPIFY_SHOP, SHOPIFY_ADMIN_TOKEN, SHOPIFY_API_SECRET."
+);
 process.exit(1);
 }
 if (!ALLOWED_ORIGIN || !FRONTEND_SHARED_SECRET) {
-console.error("Missing ALLOWED_ORIGIN or FRONTEND_SHARED_SECRET");
+console.error("Missing env. Need ALLOWED_ORIGIN, FRONTEND_SHARED_SECRET.");
 process.exit(1);
 }
 
 /* =========================
-CORS
+CORS (allow only your site)
 ========================= */
 function setCors(res, origin) {
 res.setHeader("Access-Control-Allow-Origin", origin);
 res.setHeader("Vary", "Origin");
 res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-RG-Timestamp,X-RG-Signature");
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type,X-RG-Timestamp,X-RG-Signature"
+);
 }
 
 app.options("/checkout", (req, res) => {
-if (req.headers.origin === ALLOWED_ORIGIN) setCors(res, req.headers.origin);
+const origin = req.headers.origin || "";
+if (origin === ALLOWED_ORIGIN) setCors(res, origin);
 return res.status(204).end();
 });
 
 /* =========================
 PRICING (INC VAT)
 ========================= */
+
 const PRICING = {
 BASE_RATE: 150,
 MIN_PRICE: 72.07,
-MM_FACTOR: 0.002
+MM_FACTOR: 0.002,
 };
+
+// VAT handling (UK 20%)
+const VAT_RATE = 0.2;
+const VAT_DIVISOR = 1 + VAT_RATE;
+
+function round2(n) {
+return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
+}
+
+/**
+* Given a gross (inc VAT) amount, return:
+* net (ex VAT) and vat portion (both rounded to 2dp)
+*/
+function splitVatFromGross(grossIncVat) {
+const gross = Number(grossIncVat) || 0;
+if (gross <= 0) return { net: 0, vat: 0, gross: 0 };
+
+const net = gross / VAT_DIVISOR;
+const vat = gross - net;
+
+// Round net first, then recompute vat as gross-net to keep totals consistent
+const netR = round2(net);
+const grossR = round2(gross);
+const vatR = round2(grossR - netR);
+
+return { net: netR, vat: vatR, gross: grossR };
+}
 
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
-if (!widthMm || !heightMm) return 0;
-
-if (outerGlass === "4mm Clear" && innerGlass === "4mm Clear" && selfCleaning === "No") {
-const area = (widthMm * heightMm) / 1_000_000;
-return Math.max(PRICING.MIN_PRICE, area * PRICING.BASE_RATE)
-+ (widthMm + heightMm) * PRICING.MM_FACTOR;
-}
+if (
+!Number.isFinite(widthMm) ||
+!Number.isFinite(heightMm) ||
+widthMm <= 0 ||
+heightMm <= 0
+)
 return 0;
+
+// Stage 1 priced config
+if (
+outerGlass === "4mm Clear" &&
+innerGlass === "4mm Clear" &&
+selfCleaning === "No"
+) {
+const areaM2 = (widthMm * heightMm) / 1_000_000;
+const areaCost = areaM2 * PRICING.BASE_RATE;
+const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
+return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj; // INC VAT
+}
+
+return 0; // unpriced until more stages added
 }
 
 /* =========================
-RULES
+RULES (mirror calculator)
 ========================= */
+
 function clampDims(w, h) {
-return {
-w: Math.min(2000, Math.max(150, w)),
-h: Math.min(3000, Math.max(150, h))
-};
+const min = 150,
+maxW = 2000,
+maxH = 3000;
+const cw = Math.min(maxW, Math.max(min, w));
+const ch = Math.min(maxH, Math.max(min, h));
+return { w: cw, h: ch };
 }
 
 function applyAreaRule(unit) {
-const area = (unit.widthMm * unit.heightMm) / 1_000_000;
-if (area >= 2.5 && unit.outerGlass === "4mm Clear" && unit.innerGlass === "4mm Clear") {
-return { ...unit, outerGlass: "6mm Clear", innerGlass: "6mm Clear", _areaUpgrade: true };
+const AREA_LIMIT = 2.5;
+const areaM2 = (unit.widthMm * unit.heightMm) / 1_000_000;
+
+if (
+areaM2 >= AREA_LIMIT &&
+unit.outerGlass === "4mm Clear" &&
+unit.innerGlass === "4mm Clear"
+) {
+return {
+...unit,
+outerGlass: "6mm Clear",
+innerGlass: "6mm Clear",
+_areaUpgradeApplied: true,
+};
 }
-return { ...unit, _areaUpgrade: false };
+return { ...unit, _areaUpgradeApplied: false };
 }
 
 function normalizeUnit(raw) {
-const { w, h } = clampDims(Number(raw.widthMm), Number(raw.heightMm));
-return applyAreaRule({
+const w = Number(raw.widthMm);
+const h = Number(raw.heightMm);
+const { w: cw, h: ch } = clampDims(w, h);
+
+const unit = {
 qty: Math.min(10, Math.max(1, Number(raw.qty) || 1)),
-outerGlass: String(raw.outerGlass),
-innerGlass: String(raw.innerGlass),
-cavityWidth: String(raw.cavityWidth),
+outerGlass: String(raw.outerGlass || ""),
+innerGlass: String(raw.innerGlass || ""),
+cavityWidth: String(raw.cavityWidth || ""),
 selfCleaning: String(raw.selfCleaning || "No"),
-spacer: String(raw.spacer),
-widthMm: w,
-heightMm: h,
-toughened: "Yes"
-});
+spacer: String(raw.spacer || ""),
+widthMm: cw,
+heightMm: ch,
+toughened: "Yes",
+};
+
+return applyAreaRule(unit);
 }
 
 /* =========================
-SIGNATURE CHECK
+SIGNATURE VERIFICATION (HMAC)
+signature = HMAC_SHA256(secret, `${timestamp}.${rawBody}`)
 ========================= */
-function verifySignature(req) {
-const ts = req.headers["x-rg-timestamp"];
-const sig = req.headers["x-rg-signature"];
-if (!ts || !sig) return false;
 
-const raw = req.rawBody?.toString("utf8") || "";
-const expected = crypto.createHmac("sha256", FRONTEND_SHARED_SECRET)
-.update(`${ts}.${raw}`)
+function timingSafeEqualHex(a, b) {
+const ab = Buffer.from(a, "hex");
+const bb = Buffer.from(b, "hex");
+if (ab.length !== bb.length) return false;
+return crypto.timingSafeEqual(ab, bb);
+}
+
+function verifyFrontendSignature(req) {
+const ts = String(req.headers["x-rg-timestamp"] || "");
+const sig = String(req.headers["x-rg-signature"] || "");
+
+if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
+
+// prevent replay: require timestamp within 5 minutes
+const tsNum = Number(ts);
+if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
+const skewMs = Math.abs(Date.now() - tsNum);
+if (skewMs > 5 * 60 * 1000)
+return { ok: false, reason: "Timestamp too old/new" };
+
+const raw = req.rawBody ? req.rawBody.toString("utf8") : "";
+const payloadToSign = `${ts}.${raw}`;
+const digest = crypto
+.createHmac("sha256", FRONTEND_SHARED_SECRET)
+.update(payloadToSign)
 .digest("hex");
 
-return crypto.timingSafeEqual(Buffer.from(sig, "hex"), Buffer.from(expected, "hex"));
+if (!timingSafeEqualHex(sig, digest))
+return { ok: false, reason: "Bad signature" };
+return { ok: true };
 }
 
 /* =========================
 SHOPIFY GRAPHQL
 ========================= */
-async function shopify(query, variables) {
-const res = await fetch(
-`https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`,
-{
+
+async function shopifyGraphQL(query, variables) {
+const url = `https://${SHOPIFY_SHOP}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+const res = await fetch(url, {
 method: "POST",
 headers: {
 "Content-Type": "application/json",
-"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
 },
-body: JSON.stringify({ query, variables })
-}
-);
+body: JSON.stringify({ query, variables }),
+});
+
 const json = await res.json();
-if (!res.ok || json.errors) throw new Error(JSON.stringify(json));
+if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
+if (json.errors?.length)
+throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
 }
 
-/* =========================
-FORMAT BREAKDOWN
-========================= */
-function formatBreakdown(units, total) {
-const lines = ["RightGlaze Bespoke Units (inc VAT)", ""];
+function formatBreakdown(units, totals) {
+const lines = [];
+lines.push("RightGlaze Bespoke Units – Breakdown (prices inc VAT)");
+lines.push(`Units: ${units.length}`);
+lines.push("");
+
 units.forEach((u, i) => {
-lines.push(`Unit ${i + 1} × ${u.qty}`);
-lines.push(`Outer: ${u.outerGlass}`);
-lines.push(`Inner: ${u.innerGlass}`);
-lines.push(`Cavity: ${u.cavityWidth}`);
-lines.push(`Self-cleaning: ${u.selfCleaning}`);
-lines.push(`Spacer: ${u.spacer}`);
-lines.push(`Size: ${u.widthMm}mm × ${u.heightMm}mm`);
-if (u._areaUpgrade) lines.push(`Note: Auto-upgraded to 6mm due to size`);
+const unitPrice = u._unitPriceIncVat;
+const lineTotal = unitPrice * u.qty;
+const area = (u.widthMm * u.heightMm) / 1_000_000;
+
+lines.push(`Unit ${i + 1} (Qty ${u.qty})`);
+lines.push(`- Outer: ${u.outerGlass}`);
+lines.push(`- Inner: ${u.innerGlass}`);
+lines.push(`- Cavity: ${u.cavityWidth}`);
+lines.push(`- Toughened: Yes`);
+lines.push(`- Self-cleaning: ${u.selfCleaning}`);
+lines.push(`- Spacer: ${u.spacer}`);
+lines.push(`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`);
+if (u._areaUpgradeApplied) lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
+lines.push(`- Unit price: £${unitPrice.toFixed(2)} (inc VAT)`);
+if (u.qty >= 2) lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
 lines.push("");
 });
-lines.push(`ORDER TOTAL: £${total.toFixed(2)} (inc VAT)`);
+
+lines.push(`ORDER TOTAL (INC VAT): £${totals.gross.toFixed(2)}`);
+lines.push(`VAT (20%): £${totals.vat.toFixed(2)}`);
+lines.push(`TOTAL (EX VAT): £${totals.net.toFixed(2)}`);
 return lines.join("\n");
 }
 
 /* =========================
-CHECKOUT ENDPOINT
+✅ DIRECT CHECKOUT ENDPOINT
 ========================= */
+
 app.post("/checkout", async (req, res) => {
 try {
-if (req.headers.origin !== ALLOWED_ORIGIN) return res.status(403).end();
-setCors(res, req.headers.origin);
+const origin = req.headers.origin || "";
+if (origin !== ALLOWED_ORIGIN)
+return res.status(403).json({ error: "Origin not allowed" });
+setCors(res, origin);
 
-if (!verifySignature(req)) return res.status(401).end();
+const sigOk = verifyFrontendSignature(req);
+if (!sigOk.ok)
+return res.status(401).json({ error: "Unauthorized", reason: sigOk.reason });
 
-const rawUnits = req.body?.units;
-if (!Array.isArray(rawUnits) || !rawUnits.length) {
-return res.status(400).json({ error: "No units provided" });
+const unitsRaw = req.body?.units;
+if (!Array.isArray(unitsRaw) || unitsRaw.length === 0) {
+return res.status(400).json({ error: "Missing units[]" });
 }
 
-const units = rawUnits.map(normalizeUnit);
-let grandTotal = 0;
+const units = unitsRaw.map(normalizeUnit);
 
-units.forEach(u => {
-const price = calcUnitPriceIncVat(u);
-u._unitPrice = price;
-grandTotal += price * u.qty;
+// Calculate GROSS (inc VAT) from your pricing
+let grossTotal = 0;
+for (const u of units) {
+const unitPrice = calcUnitPriceIncVat(u);
+u._unitPriceIncVat = unitPrice;
+grossTotal += unitPrice * u.qty;
+}
+
+grossTotal = round2(grossTotal);
+
+if (grossTotal <= 0) {
+return res.status(422).json({
+error:
+"This configuration is currently unpriced (total £0.00). Add more pricing stages before enabling checkout.",
 });
-
-if (grandTotal <= 0) {
-return res.status(422).json({ error: "Unpriced configuration" });
 }
+
+// Split into net + vat so Shopify can display VAT at checkout
+const totals = splitVatFromGross(grossTotal);
+const breakdown = formatBreakdown(units, totals);
 
 const mutation = `
 mutation draftOrderCreate($input: DraftOrderInput!) {
 draftOrderCreate(input: $input) {
-draftOrder { invoiceUrl }
-userErrors { message }
+draftOrder { id invoiceUrl name }
+userErrors { field message }
 }
 }
 `;
 
+/**
+* KEY CHANGE:
+* - We send NET price to Shopify (ex VAT)
+* - Mark line item taxable = true
+* - Shopify calculates VAT at checkout based on tax settings/address
+*/
 const input = {
-note: formatBreakdown(units, grandTotal),
+note: breakdown,
+tags: ["rightglaze", "bespoke", "calculator"],
 presentmentCurrencyCode: PRESENTMENT_CURRENCY,
-lineItems: [{
+taxExempt: false,
+lineItems: [
+{
 title: "Bespoke Double Glazed Units (Custom Order)",
 quantity: 1,
 requiresShipping: true,
-taxable: false,
-originalUnitPriceWithCurrency: {
-amount: grandTotal.toFixed(2),
-currencyCode: PRESENTMENT_CURRENCY
-}
-}]
+taxable: true,
+
+// ✅ Send NET (ex VAT) so Shopify adds VAT and shows it at checkout
+priceOverride: {
+amount: totals.net,
+currencyCode: PRESENTMENT_CURRENCY,
+},
+
+customAttributes: [
+{ key: "Units Count", value: String(units.length) },
+{ key: "Total (inc VAT)", value: `£${totals.gross.toFixed(2)}` },
+{ key: "VAT (20%)", value: `£${totals.vat.toFixed(2)}` },
+{ key: "Total (ex VAT)", value: `£${totals.net.toFixed(2)}` },
+],
+},
+],
 };
 
-const data = await shopify(mutation, { input });
-const invoiceUrl = data.draftOrderCreate.draftOrder.invoiceUrl;
+const data = await shopifyGraphQL(mutation, { input });
+const payload = data?.draftOrderCreate;
 
-return res.json({ invoiceUrl, grandTotal });
+if (!payload) throw new Error("No draftOrderCreate payload returned.");
+
+if (payload.userErrors?.length) {
+return res.status(400).json({ error: "Draft order error", details: payload.userErrors });
+}
+
+const invoiceUrl = payload.draftOrder?.invoiceUrl;
+if (!invoiceUrl)
+return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
+
+// Return totals (inc VAT) to frontend so your UI can show the correct figure
+return res.json({
+invoiceUrl,
+grossTotal: totals.gross,
+vatAmount: totals.vat,
+netTotal: totals.net,
+});
 } catch (err) {
 console.error(err);
-res.status(500).json({ error: "Server error" });
+return res.status(500).json({ error: "Server error", message: err.message });
 }
 });
 
-/* =========================
-HEALTH
-========================= */
-app.get("/health", (_, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true }));
 
 app.listen(PORT, () =>
-console.log(`RightGlaze draft order app running on ${PORT}`)
+console.log(`RightGlaze draft order app listening on port ${PORT}`)
 );
