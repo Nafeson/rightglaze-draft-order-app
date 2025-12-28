@@ -21,7 +21,7 @@ SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
 PORT = 3000,
 
-// ✅ New (you already set these in Render)
+// ✅ Set in Render
 ALLOWED_ORIGIN,
 FRONTEND_SHARED_SECRET,
 } = process.env;
@@ -66,33 +66,7 @@ MIN_PRICE: 72.07,
 MM_FACTOR: 0.002,
 };
 
-// VAT handling (UK 20%)
-const VAT_RATE = 0.2;
-const VAT_DIVISOR = 1 + VAT_RATE;
-
-function round2(n) {
-return Math.round((Number(n) + Number.EPSILON) * 100) / 100;
-}
-
-/**
-* Given a gross (inc VAT) amount, return:
-* net (ex VAT) and vat portion (both rounded to 2dp)
-*/
-function splitVatFromGross(grossIncVat) {
-const gross = Number(grossIncVat) || 0;
-if (gross <= 0) return { net: 0, vat: 0, gross: 0 };
-
-const net = gross / VAT_DIVISOR;
-const vat = gross - net;
-
-// Round net first, then recompute vat as gross-net to keep totals consistent
-const netR = round2(net);
-const grossR = round2(gross);
-const vatR = round2(grossR - netR);
-
-return { net: netR, vat: vatR, gross: grossR };
-}
-
+// Returns unit price INC VAT (matches your calculator Stage 1)
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
 if (
@@ -224,10 +198,17 @@ body: JSON.stringify({ query, variables }),
 });
 
 const json = await res.json();
-if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
+if (!res.ok)
+throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
 if (json.errors?.length)
 throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
+}
+
+// VAT portion when prices are INC VAT @ 20%
+// VAT = gross * 20/120 = gross/6
+function vatPortionFromGross(gross) {
+return gross / 6;
 }
 
 function formatBreakdown(units, totals) {
@@ -248,16 +229,18 @@ lines.push(`- Cavity: ${u.cavityWidth}`);
 lines.push(`- Toughened: Yes`);
 lines.push(`- Self-cleaning: ${u.selfCleaning}`);
 lines.push(`- Spacer: ${u.spacer}`);
-lines.push(`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`);
-if (u._areaUpgradeApplied) lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
+lines.push(
+`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`
+);
+if (u._areaUpgradeApplied)
+lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
 lines.push(`- Unit price: £${unitPrice.toFixed(2)} (inc VAT)`);
 if (u.qty >= 2) lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
 lines.push("");
 });
 
-lines.push(`ORDER TOTAL (INC VAT): £${totals.gross.toFixed(2)}`);
+lines.push(`ORDER TOTAL: £${totals.gross.toFixed(2)} (inc VAT)`);
 lines.push(`VAT (20%): £${totals.vat.toFixed(2)}`);
-lines.push(`TOTAL (EX VAT): £${totals.net.toFixed(2)}`);
 return lines.join("\n");
 }
 
@@ -283,7 +266,6 @@ return res.status(400).json({ error: "Missing units[]" });
 
 const units = unitsRaw.map(normalizeUnit);
 
-// Calculate GROSS (inc VAT) from your pricing
 let grossTotal = 0;
 for (const u of units) {
 const unitPrice = calcUnitPriceIncVat(u);
@@ -291,7 +273,8 @@ u._unitPriceIncVat = unitPrice;
 grossTotal += unitPrice * u.qty;
 }
 
-grossTotal = round2(grossTotal);
+// Round once at end
+grossTotal = Number(grossTotal.toFixed(2));
 
 if (grossTotal <= 0) {
 return res.status(422).json({
@@ -300,8 +283,13 @@ error:
 });
 }
 
-// Split into net + vat so Shopify can display VAT at checkout
-const totals = splitVatFromGross(grossTotal);
+const vat = Number(vatPortionFromGross(grossTotal).toFixed(2));
+
+const totals = {
+gross: grossTotal,
+vat,
+};
+
 const breakdown = formatBreakdown(units, totals);
 
 const mutation = `
@@ -313,35 +301,25 @@ userErrors { field message }
 }
 `;
 
-/**
-* KEY CHANGE:
-* - We send NET price to Shopify (ex VAT)
-* - Mark line item taxable = true
-* - Shopify calculates VAT at checkout based on tax settings/address
-*/
+// ✅ IMPORTANT: send GROSS total as priceOverride so checkout total always matches
 const input = {
 note: breakdown,
 tags: ["rightglaze", "bespoke", "calculator"],
 presentmentCurrencyCode: PRESENTMENT_CURRENCY,
-taxExempt: false,
 lineItems: [
 {
 title: "Bespoke Double Glazed Units (Custom Order)",
 quantity: 1,
 requiresShipping: true,
 taxable: true,
-
-// ✅ Send NET (ex VAT) so Shopify adds VAT and shows it at checkout
 priceOverride: {
-amount: totals.net,
+amount: totals.gross,
 currencyCode: PRESENTMENT_CURRENCY,
 },
-
 customAttributes: [
 { key: "Units Count", value: String(units.length) },
-{ key: "Total (inc VAT)", value: `£${totals.gross.toFixed(2)}` },
+{ key: "Order Total (inc VAT)", value: `£${totals.gross.toFixed(2)}` },
 { key: "VAT (20%)", value: `£${totals.vat.toFixed(2)}` },
-{ key: "Total (ex VAT)", value: `£${totals.net.toFixed(2)}` },
 ],
 },
 ],
@@ -360,13 +338,8 @@ const invoiceUrl = payload.draftOrder?.invoiceUrl;
 if (!invoiceUrl)
 return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
 
-// Return totals (inc VAT) to frontend so your UI can show the correct figure
-return res.json({
-invoiceUrl,
-grossTotal: totals.gross,
-vatAmount: totals.vat,
-netTotal: totals.net,
-});
+// ✅ return grossTotal so frontend can show correct number too
+return res.json({ invoiceUrl, grandTotal: totals.gross, vatAmount: totals.vat });
 } catch (err) {
 console.error(err);
 return res.status(500).json({ error: "Server error", message: err.message });
