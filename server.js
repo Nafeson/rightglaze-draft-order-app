@@ -6,10 +6,14 @@ const app = express();
 /* =========================
 RAW BODY (for HMAC)
 ========================= */
-app.use(express.json({
+app.use(
+express.json({
 limit: "1mb",
-verify: (req, res, buf) => { req.rawBody = buf; }
-}));
+verify: (req, res, buf) => {
+req.rawBody = buf;
+},
+})
+);
 
 const {
 SHOPIFY_SHOP,
@@ -23,7 +27,7 @@ ALLOWED_ORIGIN,
 FRONTEND_SHARED_SECRET,
 
 // Optional: anchor variant for checkout image
-ANCHOR_VARIANT_GID
+ANCHOR_VARIANT_GID,
 } = process.env;
 
 if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN || !SHOPIFY_API_SECRET) {
@@ -42,7 +46,10 @@ function setCors(res, origin) {
 res.setHeader("Access-Control-Allow-Origin", origin);
 res.setHeader("Vary", "Origin");
 res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-res.setHeader("Access-Control-Allow-Headers", "Content-Type,X-RG-Timestamp,X-RG-Signature");
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type,X-RG-Timestamp,X-RG-Signature"
+);
 }
 
 app.options("/checkout", (req, res) => {
@@ -52,43 +59,144 @@ return res.status(204).end();
 });
 
 /* =========================
-PRICING (INC VAT)
+PRICING (INC VAT) — TIER TABLES
 ========================= */
-const PRICING = {
-BASE_RATE: 150,
-MIN_PRICE: 72.07,
-MM_FACTOR: 0.002
+
+/**
+* Area bands are interpreted as:
+* - < 0.5
+* - 0.5–0.99
+* - 1.0–1.49
+* - 1.5–1.99
+* - 2.0–2.5
+* - 2.51–3.0
+*
+* NOTE: Your area upgrade rule may move 4/4 -> 6/6 at >= 2.5m²,
+* so 4mm tables above 2.5 may never be used (which is fine).
+*/
+
+function areaBand(areaM2) {
+if (areaM2 < 0.5) return "LT_0_5";
+if (areaM2 < 1.0) return "0_5_TO_0_99";
+if (areaM2 < 1.5) return "1_0_TO_1_49";
+if (areaM2 < 2.0) return "1_5_TO_1_99";
+if (areaM2 <= 2.5) return "2_0_TO_2_5";
+// > 2.5 up to 3.0
+return "2_51_TO_3_0";
+}
+
+const BASE_RATE_PER_M2 = {
+"4mm Clear|4mm Clear": {
+minPrice: 48.75,
+rates: {
+LT_0_5: 125,
+"0_5_TO_0_99": 125,
+"1_0_TO_1_49": 130,
+"1_5_TO_1_99": 132,
+"2_0_TO_2_5": 135,
+// not provided for >2.5 (typically upgraded to 6/6 by rule)
+"2_51_TO_3_0": null,
+},
+},
+
+"4mm Clear|4mm Softcoat": {
+minPrice: 48.75,
+rates: {
+LT_0_5: 130,
+"0_5_TO_0_99": 130,
+"1_0_TO_1_49": 135,
+"1_5_TO_1_99": 138,
+"2_0_TO_2_5": 145,
+// not provided for >2.5 (typically upgraded to 6/6 by rule)
+"2_51_TO_3_0": null,
+},
+},
+
+"6mm Clear|6mm Clear": {
+minPrice: 95.75,
+rates: {
+LT_0_5: 215,
+"0_5_TO_0_99": 265,
+"1_0_TO_1_49": 275,
+"1_5_TO_1_99": 283,
+"2_0_TO_2_5": 285,
+"2_51_TO_3_0": 290,
+},
+},
+
+"6mm Clear|6mm Softcoat": {
+minPrice: 127.75,
+rates: {
+LT_0_5: 225,
+"0_5_TO_0_99": 275,
+"1_0_TO_1_49": 285,
+"1_5_TO_1_99": 293,
+"2_0_TO_2_5": 295,
+"2_51_TO_3_0": 300,
+},
+},
+};
+
+const SELF_CLEANING_ADDON_PER_M2 = {
+LT_0_5: 30,
+"0_5_TO_0_99": 35,
+"1_0_TO_1_49": 40,
+"1_5_TO_1_99": 45,
+"2_0_TO_2_5": 50,
+"2_51_TO_3_0": 55,
 };
 
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
-if (!widthMm || !heightMm) return 0;
+if (!Number.isFinite(widthMm) || !Number.isFinite(heightMm) || widthMm <= 0 || heightMm <= 0) return 0;
 
-if (
-outerGlass === "4mm Clear" &&
-innerGlass === "4mm Clear" &&
-selfCleaning === "No"
-) {
 const areaM2 = (widthMm * heightMm) / 1_000_000;
-const areaCost = areaM2 * PRICING.BASE_RATE;
-const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
-return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj;
+
+const key = `${outerGlass}|${innerGlass}`;
+const table = BASE_RATE_PER_M2[key];
+if (!table) return 0;
+
+const band = areaBand(areaM2);
+const rate = table.rates[band];
+
+// If no rate exists for this band, treat as unpriced
+if (!Number.isFinite(rate)) return 0;
+
+// Base = max(min price, area * rate)
+let price = Math.max(table.minPrice, areaM2 * rate);
+
+// Self-cleaning add-on per m² (on top of base)
+if (String(selfCleaning || "").toLowerCase() === "yes") {
+const scRate = SELF_CLEANING_ADDON_PER_M2[band];
+if (Number.isFinite(scRate)) {
+price += areaM2 * scRate;
+}
 }
 
-return 0;
+return Number(price.toFixed(2));
 }
 
 /* =========================
 RULES
 ========================= */
+
+// Match your latest calculator constraints:
+// - min 150mm
+// - width absolute max 3000mm
+// - height absolute max 1732mm
+// - area max 3.0 m² (handled via dynamic messaging in frontend, but server clamps dims and can still price up to 3)
 function clampDims(w, h) {
-const min = 150, maxW = 2000, maxH = 3000;
-return {
-w: Math.min(maxW, Math.max(min, w)),
-h: Math.min(maxH, Math.max(min, h))
-};
+const min = 150;
+const maxW = 3000;
+const maxH = 1732;
+
+const cw = Math.min(maxW, Math.max(min, w));
+const ch = Math.min(maxH, Math.max(min, h));
+
+return { w: cw, h: ch };
 }
 
+// Keep your existing upgrade rule (>= 2.5m² upgrades 4/4 to 6/6)
 function applyAreaRule(unit) {
 const area = (unit.widthMm * unit.heightMm) / 1_000_000;
 if (
@@ -100,7 +208,7 @@ return {
 ...unit,
 outerGlass: "6mm Clear",
 innerGlass: "6mm Clear",
-_areaUpgradeApplied: true
+_areaUpgradeApplied: true,
 };
 }
 return { ...unit, _areaUpgradeApplied: false };
@@ -110,14 +218,14 @@ function normalizeUnit(raw) {
 const { w, h } = clampDims(Number(raw.widthMm), Number(raw.heightMm));
 return applyAreaRule({
 qty: Math.min(10, Math.max(1, Number(raw.qty) || 1)),
-outerGlass: String(raw.outerGlass),
-innerGlass: String(raw.innerGlass),
-cavityWidth: String(raw.cavityWidth),
-selfCleaning: String(raw.selfCleaning),
-spacer: String(raw.spacer),
+outerGlass: String(raw.outerGlass || ""),
+innerGlass: String(raw.innerGlass || ""),
+cavityWidth: String(raw.cavityWidth || ""),
+selfCleaning: String(raw.selfCleaning || "No"),
+spacer: String(raw.spacer || ""),
 widthMm: w,
 heightMm: h,
-toughened: "Yes"
+toughened: "Yes",
 });
 }
 
@@ -138,7 +246,8 @@ if (!ts || !sig) return false;
 
 const raw = req.rawBody.toString("utf8");
 const payload = `${ts}.${raw}`;
-const digest = crypto.createHmac("sha256", FRONTEND_SHARED_SECRET)
+const digest = crypto
+.createHmac("sha256", FRONTEND_SHARED_SECRET)
 .update(payload)
 .digest("hex");
 
@@ -155,9 +264,9 @@ const res = await fetch(
 method: "POST",
 headers: {
 "Content-Type": "application/json",
-"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN
+"X-Shopify-Access-Token": SHOPIFY_ADMIN_TOKEN,
 },
-body: JSON.stringify({ query, variables })
+body: JSON.stringify({ query, variables }),
 }
 );
 
@@ -193,11 +302,14 @@ u._unitPriceIncVat = unitPrice;
 grandTotal += unitPrice * u.qty;
 }
 
+// round once at the end
+grandTotal = Number(grandTotal.toFixed(2));
+
 if (grandTotal <= 0) {
 return res.status(422).json({ error: "Unpriced configuration" });
 }
 
-// ✅ NEW: total number of units INCLUDING qty
+// ✅ total number of units INCLUDING qty
 const totalUnits = units.reduce((sum, u) => sum + (Number(u.qty) || 0), 0);
 
 const mutation = `
@@ -209,34 +321,46 @@ userErrors { message }
 }
 `;
 
-const input = {
-presentmentCurrencyCode: PRESENTMENT_CURRENCY,
-lineItems: [{
+// Build line item and only include variantId if you have it (avoids GraphQL fussiness)
+const lineItem = {
 title: "Bespoke Double Glazed Units",
 quantity: 1,
 requiresShipping: true,
 taxable: true,
-variantId: ANCHOR_VARIANT_GID || null,
 priceOverride: {
 amount: grandTotal.toFixed(2),
-currencyCode: PRESENTMENT_CURRENCY
+currencyCode: PRESENTMENT_CURRENCY,
 },
 customAttributes: [
-// ✅ CHANGED: label + value logic
 { key: "No. of Units", value: String(totalUnits) },
-{ key: "Grand Total (inc VAT)", value: `£${grandTotal.toFixed(2)}` }
-]
-}]
+{ key: "Grand Total (inc VAT)", value: `£${grandTotal.toFixed(2)}` },
+],
+};
+
+if (ANCHOR_VARIANT_GID) {
+lineItem.variantId = ANCHOR_VARIANT_GID;
+}
+
+const input = {
+presentmentCurrencyCode: PRESENTMENT_CURRENCY,
+lineItems: [lineItem],
 };
 
 const data = await shopifyGraphQL(mutation, { input });
-const draft = data.draftOrderCreate.draftOrder;
+
+const draft = data?.draftOrderCreate?.draftOrder;
+const errs = data?.draftOrderCreate?.userErrors || [];
+if (errs.length) {
+return res.status(400).json({ error: "Draft order error", details: errs });
+}
+if (!draft?.invoiceUrl) {
+return res.status(500).json({ error: "Draft created but invoiceUrl missing" });
+}
 
 return res.json({
 invoiceUrl: draft.invoiceUrl,
-grandTotal: Number(grandTotal.toFixed(2))
+grandTotal,
 });
-
 } catch (err) {
 console.error(err);
 return res.status(500).json({ error: "Server error" });
@@ -245,6 +369,4 @@ return res.status(500).json({ error: "Server error" });
 
 app.get("/health", (_, res) => res.json({ ok: true }));
 
-app.listen(PORT, () =>
-console.log(`RightGlaze draft order app listening on ${PORT}`)
-);
+app.listen(PORT, () => console.log(`RightGlaze draft order app listening on ${PORT}`));
