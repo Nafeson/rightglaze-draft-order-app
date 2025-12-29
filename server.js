@@ -16,17 +16,14 @@ req.rawBody = buf;
 const {
 SHOPIFY_SHOP,
 SHOPIFY_ADMIN_TOKEN,
-SHOPIFY_API_SECRET,
+SHOPIFY_API_SECRET, // still used by your other code; fine to keep
 SHOPIFY_API_VERSION = "2025-10",
 PRESENTMENT_CURRENCY = "GBP",
 PORT = 3000,
 
-// ✅ Set in Render
+// ✅ New (you set these in Render)
 ALLOWED_ORIGIN,
 FRONTEND_SHARED_SECRET,
-
-// ✅ New: anchor product variant (for checkout image)
-ANCHOR_VARIANT_GID,
 } = process.env;
 
 if (!SHOPIFY_SHOP || !SHOPIFY_ADMIN_TOKEN || !SHOPIFY_API_SECRET) {
@@ -37,10 +34,6 @@ process.exit(1);
 }
 if (!ALLOWED_ORIGIN || !FRONTEND_SHARED_SECRET) {
 console.error("Missing env. Need ALLOWED_ORIGIN, FRONTEND_SHARED_SECRET.");
-process.exit(1);
-}
-if (!ANCHOR_VARIANT_GID) {
-console.error("Missing env. Need ANCHOR_VARIANT_GID.");
 process.exit(1);
 }
 
@@ -73,10 +66,8 @@ MIN_PRICE: 72.07,
 MM_FACTOR: 0.002,
 };
 
-// Returns unit price INC VAT (matches your calculator Stage 1)
 function calcUnitPriceIncVat(unit) {
 const { outerGlass, innerGlass, selfCleaning, widthMm, heightMm } = unit;
-
 if (
 !Number.isFinite(widthMm) ||
 !Number.isFinite(heightMm) ||
@@ -85,7 +76,6 @@ heightMm <= 0
 )
 return 0;
 
-// Stage 1 priced config
 if (
 outerGlass === "4mm Clear" &&
 innerGlass === "4mm Clear" &&
@@ -94,7 +84,7 @@ selfCleaning === "No"
 const areaM2 = (widthMm * heightMm) / 1_000_000;
 const areaCost = areaM2 * PRICING.BASE_RATE;
 const mmAdj = (widthMm + heightMm) * PRICING.MM_FACTOR;
-return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj; // INC VAT
+return Math.max(PRICING.MIN_PRICE, areaCost) + mmAdj;
 }
 
 return 0; // unpriced until more stages added
@@ -206,23 +196,16 @@ body: JSON.stringify({ query, variables }),
 });
 
 const json = await res.json();
-if (!res.ok)
-throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
+if (!res.ok) throw new Error(`Shopify HTTP ${res.status}: ${JSON.stringify(json)}`);
 if (json.errors?.length)
 throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
 return json.data;
 }
 
-// VAT portion when prices are INC VAT @ 20%
-// VAT = gross * 20/120 = gross/6
-function vatPortionFromGross(gross) {
-return gross / 6;
-}
-
 function formatBreakdown(units, totals) {
 const lines = [];
 lines.push("RightGlaze Bespoke Units – Breakdown (prices inc VAT)");
-lines.push(`Units: ${units.length}`);
+lines.push(`No. of Units: ${totals.noOfUnits}`); // ✅ updated label + value
 lines.push("");
 
 units.forEach((u, i) => {
@@ -237,19 +220,14 @@ lines.push(`- Cavity: ${u.cavityWidth}`);
 lines.push(`- Toughened: Yes`);
 lines.push(`- Self-cleaning: ${u.selfCleaning}`);
 lines.push(`- Spacer: ${u.spacer}`);
-lines.push(
-`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`
-);
-if (u._areaUpgradeApplied)
-lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
+lines.push(`- Size: ${u.widthMm}mm × ${u.heightMm}mm (${area.toFixed(3)} m²)`);
+if (u._areaUpgradeApplied) lines.push(`- Note: Auto-upgraded due to area ≥ 2.5m²`);
 lines.push(`- Unit price: £${unitPrice.toFixed(2)} (inc VAT)`);
-if (u.qty >= 2)
-lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
+if (u.qty >= 2) lines.push(`- Line total: £${lineTotal.toFixed(2)} (inc VAT)`);
 lines.push("");
 });
 
-lines.push(`ORDER TOTAL: £${totals.gross.toFixed(2)} (inc VAT)`);
-lines.push(`VAT (20%): £${totals.vat.toFixed(2)}`);
+lines.push(`ORDER TOTAL: £${totals.grandTotal.toFixed(2)} (inc VAT)`);
 return lines.join("\n");
 }
 
@@ -266,7 +244,9 @@ setCors(res, origin);
 
 const sigOk = verifyFrontendSignature(req);
 if (!sigOk.ok)
-return res.status(401).json({ error: "Unauthorized", reason: sigOk.reason });
+return res
+.status(401)
+.json({ error: "Unauthorized", reason: sigOk.reason });
 
 const unitsRaw = req.body?.units;
 if (!Array.isArray(unitsRaw) || unitsRaw.length === 0) {
@@ -275,26 +255,28 @@ return res.status(400).json({ error: "Missing units[]" });
 
 const units = unitsRaw.map(normalizeUnit);
 
-let grossTotal = 0;
+// ✅ No. of Units should be SUM of quantities (e.g. 1 + 5 = 6)
+// We compute server-side (don’t trust client-only totals).
+const noOfUnits = units.reduce((sum, u) => sum + (Number(u.qty) || 0), 0);
+
+let grandTotal = 0;
 for (const u of units) {
 const unitPrice = calcUnitPriceIncVat(u);
 u._unitPriceIncVat = unitPrice;
-grossTotal += unitPrice * u.qty;
+grandTotal += unitPrice * u.qty;
 }
 
-grossTotal = Number(grossTotal.toFixed(2));
-
-if (grossTotal <= 0) {
+if (grandTotal <= 0) {
 return res.status(422).json({
 error:
 "This configuration is currently unpriced (total £0.00). Add more pricing stages before enabling checkout.",
 });
 }
 
-const vat = Number(vatPortionFromGross(grossTotal).toFixed(2));
-const totals = { gross: grossTotal, vat };
-
-const breakdown = formatBreakdown(units, totals);
+const breakdown = formatBreakdown(units, {
+grandTotal,
+noOfUnits,
+});
 
 const mutation = `
 mutation draftOrderCreate($input: DraftOrderInput!) {
@@ -305,37 +287,28 @@ userErrors { field message }
 }
 `;
 
-// ✅ CRITICAL:
-// MoneyInput.amount is a Decimal scalar — send as STRING.
-const grossAmountStr = totals.gross.toFixed(2);
-
 const input = {
 note: breakdown,
 tags: ["rightglaze", "bespoke", "calculator"],
 presentmentCurrencyCode: PRESENTMENT_CURRENCY,
 lineItems: [
 {
-// ✅ Anchor to a real variant so checkout shows the product image
-variantId: ANCHOR_VARIANT_GID,
-
+title: "Bespoke Double Glazed Units (Custom Order)",
 quantity: 1,
 requiresShipping: true,
 taxable: true,
 
-// Belt + braces: set both
-originalUnitPriceWithCurrency: {
-amount: grossAmountStr,
-currencyCode: PRESENTMENT_CURRENCY,
-},
+// ✅ keep using the computed grandTotal
 priceOverride: {
-amount: grossAmountStr,
+amount: Number(grandTotal.toFixed(2)),
 currencyCode: PRESENTMENT_CURRENCY,
 },
 
 customAttributes: [
-{ key: "Units Count", value: String(units.length) },
-{ key: "Order Total (inc VAT)", value: `£${grossAmountStr}` },
-{ key: "VAT (20%)", value: `£${totals.vat.toFixed(2)}` },
+// ✅ Updated label + updated value (sum of qty)
+{ key: "No. of Units", value: String(noOfUnits) },
+
+{ key: "Grand Total (inc VAT)", value: `£${grandTotal.toFixed(2)}` },
 ],
 },
 ],
@@ -347,17 +320,21 @@ const payload = data?.draftOrderCreate;
 if (!payload) throw new Error("No draftOrderCreate payload returned.");
 
 if (payload.userErrors?.length) {
-return res.status(400).json({ error: "Draft order error", details: payload.userErrors });
+return res
+.status(400)
+.json({ error: "Draft order error", details: payload.userErrors });
 }
 
 const invoiceUrl = payload.draftOrder?.invoiceUrl;
 if (!invoiceUrl)
-return res.status(500).json({ error: "Draft order created but invoiceUrl missing." });
+return res
+.status(500)
+.json({ error: "Draft order created but invoiceUrl missing." });
 
 return res.json({
 invoiceUrl,
-grandTotal: totals.gross,
-vatAmount: totals.vat,
+grandTotal: Number(grandTotal.toFixed(2)),
+noOfUnits, // ✅ helpful for debugging/confirming
 });
 } catch (err) {
 console.error(err);
