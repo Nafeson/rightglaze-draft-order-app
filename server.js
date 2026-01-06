@@ -110,10 +110,8 @@ function money(n) {
 
 /* =========================
 BUILD LINE ITEMS
-(Updates:
- - Size attribute FIRST
- - Size always Height × Width
-)
+- DGU: unchanged (keeps Size first etc. as-is)
+- Skylight: updated order + Internal rename + hide Solar/Self when "No"
 ========================= */
 function buildLineItems(calculatorType, units) {
   const variantId = pickAnchorVariant(calculatorType);
@@ -126,13 +124,9 @@ function buildLineItems(calculatorType, units) {
     const customAttributes = [];
 
     if (type === "DGU") {
-      // ✅ Size FIRST, and Height first in value
-      customAttributes.push({
-        key: "Size",
-        value: `${u.heightMm}mm × ${u.widthMm}mm`,
-      });
-
+      // ✅ DGU SUMMARY UNCHANGED
       customAttributes.push(
+        { key: "Size", value: `${u.heightMm}mm × ${u.widthMm}mm` },
         { key: "Calculator", value: type },
         { key: "Outer Glass", value: u.outerGlass },
         { key: "Inner Glass", value: u.innerGlass },
@@ -141,24 +135,36 @@ function buildLineItems(calculatorType, units) {
         { key: "Self Cleaning", value: u.selfCleaning }
       );
     } else {
-      // ✅ Size FIRST, and Height first in value (Internal size first)
+      // ✅ SKYLIGHT SUMMARY UPDATED
+      // Order:
+      // Calculator
+      // Internal (height first)
+      // Unit Strength
+      // Glazing
+      // Tint
+      // Solar Control (omit if No)
+      // Self Cleaning (omit if No)
+
+      customAttributes.push({ key: "Calculator", value: "Skylight" });
+
       customAttributes.push({
-        key: "Size",
-        value: `${u.heightMm}mm × ${u.widthMm}mm (Internal)`,
+        key: "Internal",
+        value: `${u.heightMm}mm × ${u.widthMm}mm`,
       });
 
       customAttributes.push(
-        { key: "Calculator", value: type },
         { key: "Unit Strength", value: u.unitStrength },
         { key: "Glazing", value: u.glazing },
-        { key: "Tint", value: u.tint },
-        { key: "Solar Control", value: u.solarControl },
-        { key: "Self Cleaning", value: u.selfCleaning },
-        {
-          key: "External",
-          value: `${u.extHeightMm}mm × ${u.extWidthMm}mm`,
-        }
+        { key: "Tint", value: u.tint }
       );
+
+      if (String(u.solarControl) === "Yes") {
+        customAttributes.push({ key: "Solar Control", value: "Yes" });
+      }
+
+      if (String(u.selfCleaning) === "Yes") {
+        customAttributes.push({ key: "Self Cleaning", value: "Yes" });
+      }
     }
 
     return {
@@ -209,7 +215,18 @@ app.post("/checkout", async (req, res) => {
     };
 
     const data = await shopifyGraphql(mutation, { input });
+
+    const errs = data?.draftOrderCreate?.userErrors || [];
+    if (errs.length) {
+      return res.status(400).json({ error: "Shopify error", details: errs });
+    }
+
     const draft = data.draftOrderCreate.draftOrder;
+    if (!draft?.invoiceUrl) {
+      return res
+        .status(500)
+        .json({ error: "Checkout created but invoiceUrl missing" });
+    }
 
     return res.json({ invoiceUrl: draft.invoiceUrl });
   } catch (err) {
