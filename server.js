@@ -1,397 +1,267 @@
-/**
-* RightGlaze Draft Order App (server.js)
-* - Receives calculator payloads (dgu / skylight)
-* - Verifies HMAC (timestamp.body)
-* - Creates Shopify Draft Order with:
-* ✅ correct anchor variant per calculatorType (so image/title show)
-* ✅ customAttributes + note storing calculator grandTotal
-* ✅ line items for each confirmed unit (priced)
-*
-* IMPORTANT ENV VARS (Render → Environment):
-* - SHOPIFY_ADMIN_ACCESS_TOKEN (required) // Admin API access token
-* - SHOPIFY_SHOP_DOMAIN (required) // e.g. rightglaze.myshopify.com
-* (Alias supported: SHOPIFY_SHOP)
-* - FRONTEND_SHARED_SECRET (required) // must match calculators
-* - ANCHOR_VARIANT_GID_DGU (required) // gid://shopify/ProductVariant/...
-* - ANCHOR_VARIANT_GID_SKYLIGHT (required) // gid://shopify/ProductVariant/...
-* - SHOPIFY_API_VERSION (optional) // default 2024-07
-*
-* OPTIONAL:
-* - ALLOWED_ORIGINS (comma separated) for CORS
-*/
+// server.js (ESM)
+// ✅ Change applied: Option 2 — apply the anchor variant to EVERY unit line item
+// so each unit line gets the product image in checkout, and use priceOverride for bespoke pricing.
 
 import express from "express";
 import crypto from "crypto";
 
 const app = express();
+app.use(express.json({ limit: "1mb" }));
 
-/* ---------- Helpers ---------- */
-function mustEnv(name, { allowEmpty = false } = {}) {
-const v = process.env[name];
-if (v === undefined || (!allowEmpty && String(v).trim() === "")) {
-throw new Error(`Missing required env var: ${name}`);
-}
-return v;
-}
-
-function getEnv(name, fallback = "") {
-const v = process.env[name];
-return (v === undefined || String(v).trim() === "") ? fallback : v;
+/* -------------------- ENV -------------------- */
+function mustEnv(name) {
+  const v = process.env[name];
+  if (!v) throw new Error(`Missing required env var: ${name}`);
+  return v;
 }
 
-function asNumber(x, fallback = 0) {
-const n = Number(x);
-return Number.isFinite(n) ? n : fallback;
-}
-
-function moneyGBP(n) {
-const v = asNumber(n, 0);
-return `£${v.toFixed(2)}`;
-}
-
-function safeStr(x) {
-if (x === null || x === undefined) return "";
-return String(x);
-}
-
-function normalizeCalculatorType(x) {
-const t = String(x || "").toLowerCase().trim();
-if (t === "skylight") return "skylight";
-return "dgu"; // default
-}
-
-function calcGrandTotalFromUnits(units) {
-if (!Array.isArray(units)) return 0;
-return units.reduce((sum, u) => sum + asNumber(u?.lineTotal, 0), 0);
-}
-
-/* ---------- ENV (with backwards-compatible alias) ---------- */
-const SHOP_DOMAIN = getEnv("SHOPIFY_SHOP_DOMAIN", getEnv("SHOPIFY_SHOP", ""));
-if (!SHOP_DOMAIN) {
-// keep the same error you were seeing, but allow the alias
-throw new Error("Missing required env var: SHOPIFY_SHOP_DOMAIN");
-}
-const ADMIN_TOKEN = mustEnv("SHOPIFY_ADMIN_ACCESS_TOKEN");
+const SHOPIFY_SHOP_DOMAIN = mustEnv("SHOPIFY_SHOP_DOMAIN"); // e.g. rightglaze.myshopify.com
+const SHOPIFY_ADMIN_ACCESS_TOKEN = mustEnv("SHOPIFY_ADMIN_ACCESS_TOKEN");
 const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 
+// Anchor variants used to “carry” product image in checkout
 const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
-const API_VERSION = getEnv("SHOPIFY_API_VERSION", "2024-07");
+// Fixed API version (change if you need)
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2025-10";
+const CURRENCY_CODE = process.env.CURRENCY_CODE || "GBP";
 
-/* ---------- Middleware ---------- */
-app.use(express.json({ limit: "1mb" }));
-
-// Basic CORS (optional hardening)
-const allowedOrigins = getEnv("ALLOWED_ORIGINS", "")
-.split(",")
-.map(s => s.trim())
-.filter(Boolean);
-
-app.use((req, res, next) => {
-const origin = req.headers.origin;
-if (!origin) return next();
-
-if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
-res.setHeader("Access-Control-Allow-Origin", origin);
-res.setHeader("Vary", "Origin");
-res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-RG-Timestamp, X-RG-Signature");
-res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+/* -------------------- HELPERS -------------------- */
+function roundMoney(n) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return 0;
+  return Math.round(x * 100) / 100;
 }
 
-if (req.method === "OPTIONS") return res.sendStatus(204);
-next();
-});
-
-/* ---------- HMAC verification ---------- */
-function hmacSha256Hex(secret, message) {
-return crypto.createHmac("sha256", secret).update(message).digest("hex");
+function safeStr(v) {
+  if (v === null || v === undefined) return "";
+  return String(v);
 }
 
-function timingSafeEqualHex(a, b) {
-try {
-const ab = Buffer.from(String(a || ""), "hex");
-const bb = Buffer.from(String(b || ""), "hex");
-if (ab.length !== bb.length) return false;
-return crypto.timingSafeEqual(ab, bb);
-} catch {
-return false;
-}
+function makeAttribute(key, value) {
+  return { key: safeStr(key), value: safeStr(value) };
 }
 
-function verifySignedRequest(req) {
-const ts = req.header("X-RG-Timestamp");
-const sig = req.header("X-RG-Signature");
-if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
+// Verify HMAC: signature = HMAC(secret, `${ts}.${rawBody}`)
+function verifyHmac({ secret, timestamp, signature, rawBody }) {
+  if (!timestamp || !signature) return false;
 
-// Optional replay window (10 minutes)
-const now = Date.now();
-const tsNum = Number(ts);
-if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
-if (Math.abs(now - tsNum) > 10 * 60 * 1000) return { ok: false, reason: "Timestamp outside window" };
+  const payload = `${timestamp}.${rawBody}`;
+  const expected = crypto.createHmac("sha256", secret).update(payload).digest("hex");
 
-const rawBody = JSON.stringify(req.body ?? {});
-const toSign = `${ts}.${rawBody}`;
-const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, toSign);
-const ok = timingSafeEqualHex(expected, sig);
-return ok ? { ok: true } : { ok: false, reason: "Bad signature" };
+  try {
+    return crypto.timingSafeEqual(Buffer.from(expected, "hex"), Buffer.from(signature, "hex"));
+  } catch {
+    return false;
+  }
 }
 
-/* ---------- Shopify GraphQL ---------- */
 async function shopifyGraphQL(query, variables) {
-const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/graphql.json`;
+  const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
 
-const res = await fetch(url, {
-method: "POST",
-headers: {
-"Content-Type": "application/json",
-"X-Shopify-Access-Token": ADMIN_TOKEN
-},
-body: JSON.stringify({ query, variables })
-});
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+    },
+    body: JSON.stringify({ query, variables }),
+  });
 
-const text = await res.text();
-let json;
-try { json = JSON.parse(text); } catch { json = { raw: text }; }
+  const json = await res.json().catch(() => ({}));
 
-if (!res.ok) {
-const msg = `Shopify GraphQL HTTP ${res.status}: ${text}`;
-const err = new Error(msg);
-err.status = res.status;
-err.payload = json;
-throw err;
+  if (!res.ok) {
+    const msg = json?.errors ? JSON.stringify(json.errors) : await res.text().catch(() => "");
+    throw new Error(`Shopify GraphQL HTTP ${res.status}: ${msg}`);
+  }
+
+  if (json?.errors?.length) {
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+  }
+
+  return json.data;
 }
 
-if (json?.errors?.length) {
-const err = new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-err.payload = json;
-throw err;
+function calcTypeLabel(calculatorType) {
+  const t = String(calculatorType || "").toLowerCase();
+  if (t === "dgu") return "DGU";
+  if (t === "skylight") return "Skylight";
+  return "Calculator";
 }
 
-return json.data;
+function anchorVariantForType(calculatorType) {
+  const t = String(calculatorType || "").toLowerCase();
+  if (t === "skylight") return ANCHOR_VARIANT_GID_SKYLIGHT;
+  return ANCHOR_VARIANT_GID_DGU;
 }
 
-/* ---------- Draft Order creation ---------- */
-function getAnchorVariantGid(calculatorType) {
-return calculatorType === "skylight"
-? ANCHOR_VARIANT_GID_SKYLIGHT
-: ANCHOR_VARIANT_GID_DGU;
+/* Build customAttributes for DGU unit */
+function buildDguAttributes(u) {
+  const attrs = [];
+  attrs.push(makeAttribute("Calculator", "DGU"));
+  attrs.push(makeAttribute("Outer Glass", u.outerGlass));
+  attrs.push(makeAttribute("Inner Glass", u.innerGlass));
+  attrs.push(makeAttribute("Cavity", u.cavityWidth));
+  attrs.push(makeAttribute("Size", `${u.widthMm}×${u.heightMm}mm`));
+  attrs.push(makeAttribute("Spacer", u.spacer));
+  attrs.push(makeAttribute("Self Cleaning", u.selfCleaning));
+  attrs.push(makeAttribute("Unit Price", `£${roundMoney(u.unitPrice).toFixed(2)}`));
+  attrs.push(makeAttribute("Line Total", `£${roundMoney(u.lineTotal).toFixed(2)}`));
+  return attrs;
 }
 
-function labelForCalculatorType(calculatorType) {
-// ✅ ensure capitalised output (you asked for this)
-return calculatorType === "skylight" ? "Skylight" : "DGU";
+/* Build customAttributes for Skylight unit */
+function buildSkylightAttributes(u) {
+  const attrs = [];
+  attrs.push(makeAttribute("Calculator", "Skylight"));
+  attrs.push(makeAttribute("Unit Strength", u.unitStrength));
+  attrs.push(makeAttribute("Glazing", u.glazing));
+  if (u.borderMm) attrs.push(makeAttribute("Border", `${u.borderMm}mm`));
+
+  // Use your existing orientation (your screenshot shows "Internal 500x800mm")
+  attrs.push(makeAttribute("Internal", `${u.widthMm}×${u.heightMm}mm`));
+  if (u.extWidthMm && u.extHeightMm) {
+    attrs.push(makeAttribute("External", `${u.extWidthMm}×${u.extHeightMm}mm`));
+  }
+
+  attrs.push(makeAttribute("Tint", u.tint));
+  attrs.push(makeAttribute("Solar Control", u.solarControl));
+  attrs.push(makeAttribute("Self Cleaning", u.selfCleaning));
+
+  attrs.push(makeAttribute("Unit Price", `£${roundMoney(u.unitPrice).toFixed(2)}`));
+  attrs.push(makeAttribute("Line Total", `£${roundMoney(u.lineTotal).toFixed(2)}`));
+  return attrs;
 }
 
-function buildCalculatorSummaryLines(calculatorType, units) {
-// Keep this short but useful; shows on invoice / draft order details.
-const lines = [];
-lines.push(`${labelForCalculatorType(calculatorType)} Calculator`);
+/* ✅ Core change: every unit becomes a VARIANT line item (image comes from product),
+   and priceOverride sets bespoke unit price. */
+function buildDraftLineItemsFromUnits({ calculatorType, units }) {
+  const anchorVariantId = anchorVariantForType(calculatorType);
+  const label = calcTypeLabel(calculatorType);
 
-const qtySum = Array.isArray(units)
-? units.reduce((s, u) => s + asNumber(u?.qty, 0), 0)
-: 0;
+  return (units || []).map((u, idx) => {
+    const qty = Math.max(1, Number(u.qty) || 1);
+    const unitPrice = roundMoney(u.unitPrice);
 
-if (qtySum) lines.push(`Total Units: ${qtySum}`);
-return lines;
+    const customAttributes =
+      String(calculatorType || "").toLowerCase() === "skylight"
+        ? buildSkylightAttributes(u)
+        : buildDguAttributes(u);
+
+    return {
+      variantId: anchorVariantId,
+      quantity: qty,
+
+      // ✅ Bespoke pricing
+      priceOverride: {
+        amount: unitPrice.toFixed(2),
+        currencyCode: CURRENCY_CODE,
+      },
+
+      // Optional: unique id per line
+      uuid: `${label.toLowerCase()}-${Date.now()}-${idx}-${Math.random().toString(16).slice(2)}`,
+
+      customAttributes,
+    };
+  });
 }
 
-// Build a readable description per unit for the draft order "custom" line item
-function buildUnitTitle(calculatorType, u) {
-if (calculatorType === "skylight") {
-// Use the same field names your skylight payload sends
-const strength = safeStr(u.unitStrength);
-const glazing = safeStr(u.glazing);
-const tint = safeStr(u.tint);
-const sc = safeStr(u.solarControl);
-const self = safeStr(u.selfCleaning);
-
-const w = asNumber(u.widthMm, 0);
-const h = asNumber(u.heightMm, 0);
-const extW = asNumber(u.extWidthMm, 0);
-const extH = asNumber(u.extHeightMm, 0);
-
-const bits = [
-"Bespoke Frameless Skylight",
-strength && `• ${strength}`,
-glazing && `• ${glazing}`,
-`• Internal ${h}×${w}mm`,
-(extH && extW) ? `• External ${extH}×${extW}mm` : "",
-tint ? `• Tint ${tint}` : "",
-sc ? `• Solar Control ${sc}` : "",
-self ? `• Self Cleaning ${self}` : ""
-].filter(Boolean);
-
-return bits.join(" ");
+function sumLineTotals(units) {
+  return roundMoney(
+    (units || []).reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0)
+  );
 }
 
-// DGU
-const outer = safeStr(u.outerGlass);
-const inner = safeStr(u.innerGlass);
-const cavity = safeStr(u.cavityWidth);
-const spacer = safeStr(u.spacer);
-const self = safeStr(u.selfCleaning);
-
-const w = asNumber(u.widthMm, 0);
-const h = asNumber(u.heightMm, 0);
-
-const bits = [
-"Bespoke Double Glazed Unit",
-outer ? `• Outer ${outer}` : "",
-inner ? `• Inner ${inner}` : "",
-cavity ? `• Cavity ${cavity}` : "",
-`• ${h}×${w}mm`,
-spacer ? `• Spacer ${spacer}` : "",
-self ? `• Self Cleaning ${self}` : ""
-].filter(Boolean);
-
-return bits.join(" ");
-}
-
-function buildCustomLineItems(calculatorType, units) {
-const items = [];
-if (!Array.isArray(units)) return items;
-
-units.forEach((u) => {
-const qty = Math.max(1, Math.min(100, asNumber(u?.qty, 1)));
-const unitPrice = asNumber(u?.unitPrice, 0);
-const lineTotal = asNumber(u?.lineTotal, unitPrice * qty);
-
-// Skip free/invalid items (you already guard this client-side, but keep safe)
-if (!(lineTotal > 0) || !(unitPrice > 0)) return;
-
-items.push({
-title: buildUnitTitle(calculatorType, u),
-quantity: qty,
-// DraftOrderCreate input uses originalUnitPrice / originalUnitPriceWithCurrency?
-// The safe & supported field is "originalUnitPrice" (Money).
-originalUnitPrice: unitPrice.toFixed(2),
-// Put extra info into "customAttributes" so the merchant can see it
-customAttributes: [
-{ key: "Calculator", value: labelForCalculatorType(calculatorType) },
-{ key: "Unit Price", value: moneyGBP(unitPrice) },
-{ key: "Line Total", value: moneyGBP(lineTotal) }
-]
-});
-});
-
-return items;
-}
-
-const DRAFT_ORDER_CREATE = `
-mutation DraftOrderCreate($input: DraftOrderInput!) {
-draftOrderCreate(input: $input) {
-draftOrder {
-id
-invoiceUrl
-}
-userErrors {
-field
-message
-}
-}
-}
-`;
-
-/* ---------- Routes ---------- */
-app.get("/", (req, res) => {
-res.status(200).send("OK");
-});
+/* -------------------- ROUTES -------------------- */
+app.get("/", (_req, res) => res.status(200).send("OK"));
 
 app.post("/checkout", async (req, res) => {
-// 1) Verify signature
-const sig = verifySignedRequest(req);
-if (!sig.ok) {
-return res.status(401).json({ error: "Unauthorized", reason: sig.reason });
-}
+  try {
+    const ts = req.header("X-RG-Timestamp");
+    const sig = req.header("X-RG-Signature");
 
-try {
-const body = req.body || {};
-const calculatorType = normalizeCalculatorType(body.calculatorType);
-const units = Array.isArray(body.units) ? body.units : [];
+    const rawBody = JSON.stringify(req.body ?? {});
+    const ok = verifyHmac({
+      secret: FRONTEND_SHARED_SECRET,
+      timestamp: ts,
+      signature: sig,
+      rawBody,
+    });
 
-// ✅ grandTotal: prefer client, fallback to sum(lineTotal)
-const computedGrandTotal = calcGrandTotalFromUnits(units);
-const grandTotal = asNumber(body.grandTotal, computedGrandTotal);
+    if (!ok) {
+      return res.status(401).json({ error: "Invalid signature" });
+    }
 
-const totalUnitsQty = asNumber(body.totalUnitsQty, units.reduce((s, u) => s + asNumber(u?.qty, 0), 0));
+    const body = req.body || {};
+    const calculatorType = body.calculatorType; // "dgu" | "skylight"
+    const units = Array.isArray(body.units) ? body.units : [];
 
-// 2) Anchor line item (variant) to force product image/title in checkout
-const anchorVariantId = getAnchorVariantGid(calculatorType);
+    if (!units.length) {
+      return res.status(400).json({ error: "No units provided" });
+    }
 
-// 3) Custom line items for each unit
-const customLineItems = buildCustomLineItems(calculatorType, units);
+    // Prefer grandTotal sent by frontend, fallback to summing line totals.
+    const providedGrand = roundMoney(body.grandTotal);
+    const computedGrand = sumLineTotals(units);
+    const grandTotal = providedGrand > 0 ? providedGrand : computedGrand;
 
-// If nothing priced, fail fast
-if (customLineItems.length === 0) {
-return res.status(400).json({ error: "No priced units to checkout" });
-}
+    const lineItems = buildDraftLineItemsFromUnits({ calculatorType, units });
 
-// 4) Persist calculator meta to draft order
-const summaryLines = buildCalculatorSummaryLines(calculatorType, units);
+    // Draft note: helps you see totals/type in admin
+    const note = `Calculator: ${calcTypeLabel(calculatorType)} | Grand Total: £${grandTotal.toFixed(
+      2
+    )}`;
 
-// ✅ capitalised outputs
-const attributes = [
-{ key: "Calculator Type", value: labelForCalculatorType(calculatorType) },
-{ key: "Grand Total", value: moneyGBP(grandTotal) }, // ✅ THIS IS THE CHANGE YOU ASKED FOR
-{ key: "Total Units", value: String(totalUnitsQty) }
-];
+    const mutation = `
+      mutation DraftOrderCreate($input: DraftOrderInput!) {
+        draftOrderCreate(input: $input) {
+          draftOrder {
+            id
+            invoiceUrl
+          }
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
 
-// 5) Draft order input
-const input = {
-// NOTE: Keep the draft order open for invoice/checkout
-// status: "OPEN", // Shopify sets status; not always accepted here
-note: `${summaryLines.join(" • ")} • Grand Total: ${moneyGBP(grandTotal)}`, // ✅ shows in admin; often on invoice
-customAttributes: attributes,
+    const variables = {
+      input: {
+        lineItems,
+        note,
+      },
+    };
 
-// Line items: anchor variant first, then custom items
-lineItems: [
-{
-variantId: anchorVariantId,
-quantity: 1
-// Price will come from variant; your server can override via appliedDiscount if needed
-},
-...customLineItems
-]
-};
+    const data = await shopifyGraphQL(mutation, variables);
 
-const data = await shopifyGraphQL(DRAFT_ORDER_CREATE, { input });
-const result = data?.draftOrderCreate;
+    const userErrors = data?.draftOrderCreate?.userErrors || [];
+    if (userErrors.length) {
+      return res.status(400).json({
+        error: "Shopify draftOrderCreate userErrors",
+        reason: userErrors.map((e) => e.message).join("; "),
+      });
+    }
 
-const userErrors = result?.userErrors || [];
-if (userErrors.length) {
-return res.status(400).json({
-error: "Shopify error",
-reason: userErrors.map(e => e.message).join(" | "),
-userErrors
-});
-}
+    const invoiceUrl = data?.draftOrderCreate?.draftOrder?.invoiceUrl;
+    if (!invoiceUrl) {
+      return res.status(500).json({ error: "Draft created but invoiceUrl missing" });
+    }
 
-const invoiceUrl = result?.draftOrder?.invoiceUrl;
-if (!invoiceUrl) {
-return res.status(500).json({ error: "Checkout created but invoiceUrl missing" });
-}
-
-return res.status(200).json({ invoiceUrl });
-} catch (err) {
-console.error(err);
-
-// Make Shopify auth issues obvious
-const msg = String(err?.message || "Server error");
-if (msg.includes("Invalid API key") || msg.includes("access token") || msg.includes("401")) {
-return res.status(500).json({
-error: "Shopify auth error",
-reason: msg
-});
-}
-
-return res.status(500).json({ error: "Server error", reason: msg });
-}
+    return res.status(200).json({ invoiceUrl });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({
+      error: "Server error",
+      reason: err?.message || String(err),
+    });
+  }
 });
 
-/* ---------- Start ---------- */
-const PORT = asNumber(process.env.PORT, 3000);
+/* -------------------- START -------------------- */
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-console.log(`Server listening on port ${PORT}`);
-console.log(`Shop domain: ${SHOP_DOMAIN}`);
+  console.log(`Draft order app listening on port ${PORT}`);
 });
