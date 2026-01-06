@@ -6,19 +6,19 @@ import express from "express";
 import crypto from "crypto";
 
 /* =========================
-   APP
+APP
 ========================= */
 const app = express();
 
 /* =========================
-   ENV
+ENV
 ========================= */
 function mustEnv(name) {
-  const v = process.env[name];
-  if (!v || !String(v).trim()) {
-    throw new Error(`Missing required env var: ${name}`);
-  }
-  return String(v).trim();
+const v = process.env[name];
+if (!v || !String(v).trim()) {
+throw new Error(`Missing required env var: ${name}`);
+}
+return String(v).trim();
 }
 
 const SHOPIFY_SHOP_DOMAIN = mustEnv("SHOPIFY_SHOP_DOMAIN");
@@ -29,226 +29,237 @@ const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
 const PRESENTMENT_CURRENCY_CODE =
-  (process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
+(process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
 
 /* =========================
-   RAW BODY (HMAC)
+RAW BODY (HMAC)
 ========================= */
-app.use(express.json({
-  limit: "1mb",
-  verify: (req, res, buf) => {
-    req.rawBody = buf.toString("utf8");
-  }
-}));
+app.use(
+express.json({
+limit: "1mb",
+verify: (req, res, buf) => {
+req.rawBody = buf.toString("utf8");
+},
+})
+);
 
 /* =========================
-   CORS (MANUAL)
+CORS (MANUAL)
 ========================= */
 app.use((req, res, next) => {
-  const origin = req.headers.origin || "*";
+const origin = req.headers.origin || "*";
 
-  res.setHeader("Access-Control-Allow-Origin", origin);
-  res.setHeader("Vary", "Origin");
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type, X-RG-Timestamp, X-RG-Signature"
-  );
+res.setHeader("Access-Control-Allow-Origin", origin);
+res.setHeader("Vary", "Origin");
+res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
+res.setHeader(
+"Access-Control-Allow-Headers",
+"Content-Type, X-RG-Timestamp, X-RG-Signature"
+);
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end();
-  }
+if (req.method === "OPTIONS") {
+return res.status(204).end();
+}
 
-  next();
+next();
 });
 
 /* =========================
-   SECURITY
+SECURITY
 ========================= */
 function hmacSha256Hex(secret, msg) {
-  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
+return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
 
 function requireValidSignature(req) {
-  const ts = req.header("X-RG-Timestamp");
-  const sig = req.header("X-RG-Signature");
+const ts = req.header("X-RG-Timestamp");
+const sig = req.header("X-RG-Signature");
 
-  if (!ts || !sig) throw new Error("Missing signature headers");
+if (!ts || !sig) throw new Error("Missing signature headers");
 
-  const expected = hmacSha256Hex(
-    FRONTEND_SHARED_SECRET,
-    `${ts}.${req.rawBody}`
-  );
+const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, `${ts}.${req.rawBody}`);
 
-  if (
-    !crypto.timingSafeEqual(
-      Buffer.from(expected),
-      Buffer.from(sig)
-    )
-  ) {
-    throw new Error("Invalid signature");
-  }
+if (
+!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))
+) {
+throw new Error("Invalid signature");
+}
 }
 
 /* =========================
-   HELPERS
+HELPERS
 ========================= */
-const money = n => ({
-  amount: Number(n || 0).toFixed(2),
-  currencyCode: PRESENTMENT_CURRENCY_CODE
+const money = (n) => ({
+amount: Number(n || 0).toFixed(2),
+currencyCode: PRESENTMENT_CURRENCY_CODE,
 });
 
-const fmtGBP = n => `£${Number(n || 0).toFixed(2)}`;
+const fmtGBP = (n) => `£${Number(n || 0).toFixed(2)}`;
 
-const dimsHW = (h, w) =>
-  (Number.isFinite(h) && Number.isFinite(w))
-    ? `${h}mm × ${w}mm`
-    : "—";
+// Width × Height formatter (as requested)
+function dimsWH(w, h) {
+const ww = Number(w);
+const hh = Number(h);
+if (Number.isFinite(ww) && Number.isFinite(hh)) return `${ww}mm × ${hh}mm`;
+return "—";
+}
 
-const grandTotalFromUnits = units =>
-  units.reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0);
+const grandTotalFromUnits = (units) =>
+units.reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0);
 
 /* =========================
-   SUMMARY BUILDERS
+SUMMARY BUILDERS
 ========================= */
 function buildDguAttributes(u) {
-  const a = [];
+const a = [];
 
-  a.push({ key: "Size", value: dimsHW(u.heightMm ?? u.h, u.widthMm ?? u.w) });
-  a.push({ key: "Outer Glass", value: u.outerGlass });
-  a.push({ key: "Inner Glass", value: u.innerGlass });
+// Keep DGU summary logic/order as-is aside from removing Line Total
+const w = u.widthMm ?? u.w;
+const h = u.heightMm ?? u.h;
 
-  if (u.qty > 1) {
-    a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
-  }
+a.push({ key: "Size", value: dimsWH(w, h) });
+a.push({ key: "Outer Glass", value: u.outerGlass });
+a.push({ key: "Inner Glass", value: u.innerGlass });
 
-  a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
+if (u.qty > 1) {
+a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
+}
 
-  return a;
+// ✅ CHANGE: do NOT include Line Total in summary
+return a;
 }
 
 function buildSkylightAttributes(u) {
-  const a = [];
+const a = [];
 
-  a.push({ key: "Calculator", value: "Skylight" });
-  a.push({ key: "Internal", value: dimsHW(u.h, u.w) });
-  a.push({ key: "Unit Strength", value: u.unitStrength });
-  a.push({ key: "Glazing", value: u.glazing });
-  a.push({ key: "Tint", value: u.tint });
+// ✅ Internal must pull through and be width × height
+const internalW = u.widthMm ?? u.w;
+const internalH = u.heightMm ?? u.h;
 
-  if (String(u.solarControl).toLowerCase() === "yes") {
-    a.push({ key: "Solar Control", value: "Yes" });
-  }
+// ✅ External must match the red popup output (same ext dims your calculator computes)
+// Prefer extWidthMm/extHeightMm from payload; fall back to extW/extH
+const externalW = u.extWidthMm ?? u.extW;
+const externalH = u.extHeightMm ?? u.extH;
 
-  if (String(u.selfCleaning).toLowerCase() === "yes") {
-    a.push({ key: "Self Cleaning", value: "Yes" });
-  }
+a.push({ key: "Calculator", value: "Skylight" });
+a.push({ key: "Internal", value: dimsWH(internalW, internalH) });
+a.push({ key: "Unit Strength", value: u.unitStrength });
+a.push({ key: "Glazing", value: u.glazing });
+a.push({ key: "Tint", value: u.tint });
 
-  if (u.qty > 1) {
-    a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
-  }
+if (String(u.solarControl).toLowerCase() === "yes") {
+a.push({ key: "Solar Control", value: "Yes" });
+}
 
-  a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
+if (String(u.selfCleaning).toLowerCase() === "yes") {
+a.push({ key: "Self Cleaning", value: "Yes" });
+}
 
-  if (Number.isFinite(u.extH) && Number.isFinite(u.extW)) {
-    a.push({ key: "External", value: dimsHW(u.extH, u.extW) });
-  }
+if (u.qty > 1) {
+a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
+}
 
-  return a;
+// ✅ CHANGE: do NOT include Line Total in summary
+
+// ✅ External must be LAST
+if (Number.isFinite(Number(externalW)) && Number.isFinite(Number(externalH))) {
+a.push({ key: "External", value: dimsWH(externalW, externalH) });
+}
+
+return a;
 }
 
 /* =========================
-   SHOPIFY GRAPHQL
+SHOPIFY GRAPHQL
 ========================= */
 async function shopifyGraphql(query, variables) {
-  const res = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-10/graphql.json`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN
-      },
-      body: JSON.stringify({ query, variables })
-    }
-  );
+const res = await fetch(
+`https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-10/graphql.json`,
+{
+method: "POST",
+headers: {
+"Content-Type": "application/json",
+"X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+},
+body: JSON.stringify({ query, variables }),
+}
+);
 
-  const json = await res.json();
-  if (!res.ok || json.errors) {
-    throw new Error(JSON.stringify(json.errors));
-  }
+const json = await res.json();
+if (!res.ok || json.errors) {
+throw new Error(JSON.stringify(json.errors));
+}
 
-  return json.data;
+return json.data;
 }
 
 /* =========================
-   CHECKOUT
+CHECKOUT
 ========================= */
 app.post("/checkout", async (req, res) => {
-  try {
-    requireValidSignature(req);
+try {
+requireValidSignature(req);
 
-    const { calculatorType, units, totalUnitsQty } = req.body;
-    if (!units || !units.length) throw new Error("No units provided");
+const { calculatorType, units, totalUnitsQty } = req.body;
+if (!units || !units.length) throw new Error("No units provided");
 
-    const isSkylight = calculatorType === "skylight";
-    const variantId = isSkylight
-      ? ANCHOR_VARIANT_GID_SKYLIGHT
-      : ANCHOR_VARIANT_GID_DGU;
+const isSkylight = calculatorType === "skylight";
+const variantId = isSkylight
+? ANCHOR_VARIANT_GID_SKYLIGHT
+: ANCHOR_VARIANT_GID_DGU;
 
-    const lineItems = units.map(u => ({
-      variantId,
-      quantity: u.qty,
-      priceOverride: money(u.unitPrice),
-      customAttributes: isSkylight
-        ? buildSkylightAttributes(u)
-        : buildDguAttributes(u)
-    }));
+const lineItems = units.map((u) => ({
+variantId,
+quantity: u.qty,
+priceOverride: money(u.unitPrice),
+customAttributes: isSkylight
+? buildSkylightAttributes(u)
+: buildDguAttributes(u),
+}));
 
-    const grandTotal = grandTotalFromUnits(units);
+const grandTotal = grandTotalFromUnits(units);
 
-    const input = {
-      note: "Created via RightGlaze calculator checkout",
-      tags: [`calculator:${calculatorType}`],
-      presentmentCurrencyCode: PRESENTMENT_CURRENCY_CODE,
-      customAttributes: [
-        { key: "Calculator Type", value: calculatorType },
-        { key: "Total Units Qty", value: String(totalUnitsQty) },
-        { key: "Grand Total", value: fmtGBP(grandTotal) }
-      ],
-      lineItems
-    };
+const input = {
+note: "Created via RightGlaze calculator checkout",
+tags: [`calculator:${calculatorType}`],
+presentmentCurrencyCode: PRESENTMENT_CURRENCY_CODE,
+customAttributes: [
+{ key: "Calculator Type", value: calculatorType },
+{ key: "Total Units Qty", value: String(totalUnitsQty) },
+{ key: "Grand Total", value: fmtGBP(grandTotal) },
+],
+lineItems,
+};
 
-    const data = await shopifyGraphql(
-      `mutation($input: DraftOrderInput!) {
-        draftOrderCreate(input: $input) {
-          draftOrder { invoiceUrl }
-          userErrors { message }
-        }
-      }`,
-      { input }
-    );
+const data = await shopifyGraphql(
+`mutation($input: DraftOrderInput!) {
+draftOrderCreate(input: $input) {
+draftOrder { invoiceUrl }
+userErrors { message }
+}
+}`,
+{ input }
+);
 
-    const out = data.draftOrderCreate;
-    if (out.userErrors.length) {
-      throw new Error(out.userErrors[0].message);
-    }
+const out = data.draftOrderCreate;
+if (out.userErrors.length) {
+throw new Error(out.userErrors[0].message);
+}
 
-    res.json({ invoiceUrl: out.draftOrder.invoiceUrl });
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      error: "Server error",
-      reason: String(err.message || err)
-    });
-  }
+res.json({ invoiceUrl: out.draftOrder.invoiceUrl });
+} catch (err) {
+console.error(err);
+res.status(500).json({
+error: "Server error",
+reason: String(err.message || err),
+});
+}
 });
 
 /* =========================
-   START
+START
 ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`RightGlaze Draft Order app running on ${PORT}`);
+console.log(`RightGlaze Draft Order app running on ${PORT}`);
 });
