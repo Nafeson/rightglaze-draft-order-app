@@ -44,10 +44,7 @@ app.options("/checkout", (req, res) => {
 /* =========================
 RAW BODY (for HMAC)
 ========================= */
-app.post(
-  "/checkout",
-  express.raw({ type: "application/json", limit: "1mb" })
-);
+app.post("/checkout", express.raw({ type: "application/json", limit: "1mb" }));
 
 /* =========================
 HMAC VERIFY
@@ -113,7 +110,10 @@ function money(n) {
 
 /* =========================
 BUILD LINE ITEMS
-(ONLY CHANGES YOU REQUESTED)
+(Updates:
+ - Size attribute FIRST
+ - Size always Height × Width
+)
 ========================= */
 function buildLineItems(calculatorType, units) {
   const variantId = pickAnchorVariant(calculatorType);
@@ -123,50 +123,48 @@ function buildLineItems(calculatorType, units) {
     const qty = Math.max(1, Number(u.qty) || 1);
     const unitPrice = Number(u.unitPrice) || 0;
 
-    const customAttributes = [
-      { key: "Calculator", value: type },
-    ];
+    const customAttributes = [];
 
     if (type === "DGU") {
+      // ✅ Size FIRST, and Height first in value
+      customAttributes.push({
+        key: "Size",
+        value: `${u.heightMm}mm × ${u.widthMm}mm`,
+      });
+
       customAttributes.push(
+        { key: "Calculator", value: type },
         { key: "Outer Glass", value: u.outerGlass },
         { key: "Inner Glass", value: u.innerGlass },
         { key: "Cavity", value: u.cavityWidth },
         { key: "Spacer", value: u.spacer },
-        { key: "Self Cleaning", value: u.selfCleaning },
-        {
-          key: "Size",
-          value: `${u.widthMm}mm × ${u.heightMm}mm`,
-        }
+        { key: "Self Cleaning", value: u.selfCleaning }
       );
     } else {
+      // ✅ Size FIRST, and Height first in value (Internal size first)
+      customAttributes.push({
+        key: "Size",
+        value: `${u.heightMm}mm × ${u.widthMm}mm (Internal)`,
+      });
+
       customAttributes.push(
+        { key: "Calculator", value: type },
         { key: "Unit Strength", value: u.unitStrength },
         { key: "Glazing", value: u.glazing },
         { key: "Tint", value: u.tint },
         { key: "Solar Control", value: u.solarControl },
         { key: "Self Cleaning", value: u.selfCleaning },
         {
-          key: "Internal",
-          value: `${u.widthMm}mm × ${u.heightMm}mm`,
-        },
-        {
           key: "External",
-          value: `${u.extWidthMm}mm × ${u.extHeightMm}mm`,
+          value: `${u.extHeightMm}mm × ${u.extWidthMm}mm`,
         }
       );
     }
 
     return {
       variantId,
-
-      // ✅ FIX: quantity badge now matches calculator qty
       quantity: qty,
-
-      // ✅ FIX: per-unit price (NOT line total)
       originalUnitPrice: money(unitPrice),
-
-      // ✅ Multi-line summary in checkout
       customAttributes,
     };
   });
