@@ -1,16 +1,24 @@
+// server.js (ESM)
+// RightGlaze Draft Order app — DGU + Skylight
+// ✔ Correct prices via priceOverride
+// ✔ Correct quantity badge
+// ✔ Multiline checkout summary
+// ✔ Grand total persisted
+// ✔ External line added LAST for skylight summary
+
 import express from "express";
+import cors from "cors";
 import crypto from "crypto";
 
 const app = express();
-app.set("trust proxy", 1);
 
 /* =========================
-ENV
+   ENV
 ========================= */
 function mustEnv(name) {
   const v = process.env[name];
-  if (!v) throw new Error(`Missing required env var: ${name}`);
-  return v;
+  if (!v || !String(v).trim()) throw new Error(`Missing required env var: ${name}`);
+  return String(v).trim();
 }
 
 const SHOPIFY_SHOP_DOMAIN = mustEnv("SHOPIFY_SHOP_DOMAIN");
@@ -20,225 +28,188 @@ const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
+const PRESENTMENT_CURRENCY_CODE = (process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
+
 /* =========================
-CORS / PREFLIGHT
+   CORS / BODY
 ========================= */
-function setCors(req, res) {
-  const origin = req.headers.origin;
-  if (origin) {
-    res.setHeader("Access-Control-Allow-Origin", origin);
-    res.setHeader("Vary", "Origin");
-  }
-  res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-  res.setHeader(
-    "Access-Control-Allow-Headers",
-    "Content-Type,X-RG-Timestamp,X-RG-Signature"
-  );
+app.use(cors({ origin: "*", methods: ["GET","POST","OPTIONS"] }));
+app.options("*", cors());
+
+app.use(express.json({
+  limit: "1mb",
+  verify: (req, res, buf) => { req.rawBody = buf.toString("utf8"); }
+}));
+
+/* =========================
+   SECURITY
+========================= */
+function hmacSha256Hex(secret, msg){
+  return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 }
 
-app.options("/checkout", (req, res) => {
-  setCors(req, res);
-  res.status(204).end();
-});
-
-/* =========================
-RAW BODY (for HMAC)
-========================= */
-app.post("/checkout", express.raw({ type: "application/json", limit: "1mb" }));
-
-/* =========================
-HMAC VERIFY
-========================= */
-function timingSafeEqualHex(a, b) {
-  const ba = Buffer.from(a, "hex");
-  const bb = Buffer.from(b, "hex");
-  if (ba.length !== bb.length) return false;
-  return crypto.timingSafeEqual(ba, bb);
-}
-
-function verifySignature(req, rawBody) {
+function requireValidSignature(req){
   const ts = req.header("X-RG-Timestamp");
   const sig = req.header("X-RG-Signature");
-  if (!ts || !sig) return false;
+  if (!ts || !sig) throw new Error("Missing signature headers");
 
-  const payload = `${ts}.${rawBody}`;
-  const expected = crypto
-    .createHmac("sha256", FRONTEND_SHARED_SECRET)
-    .update(payload)
-    .digest("hex");
+  const expected = hmacSha256Hex(
+    FRONTEND_SHARED_SECRET,
+    `${ts}.${req.rawBody}`
+  );
 
-  return timingSafeEqualHex(expected, sig);
+  if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))){
+    throw new Error("Invalid signature");
+  }
 }
 
 /* =========================
-SHOPIFY GRAPHQL
+   HELPERS
 ========================= */
-async function shopifyGraphql(query, variables) {
+const money = n => ({
+  amount: Number(n || 0).toFixed(2),
+  currencyCode: PRESENTMENT_CURRENCY_CODE
+});
+
+const fmtGBP = n => `£${Number(n || 0).toFixed(2)}`;
+
+const dimsHW = (h, w) =>
+  (Number.isFinite(h) && Number.isFinite(w)) ? `${h}mm × ${w}mm` : "—";
+
+const grandTotalFromUnits = units =>
+  units.reduce((s,u)=>s + (Number(u.lineTotal)||0), 0);
+
+/* =========================
+   SUMMARY BUILDERS
+========================= */
+
+// DGU unchanged
+function buildDguAttributes(u){
+  const a = [];
+  a.push({ key:"Size", value:dimsHW(u.heightMm ?? u.h, u.widthMm ?? u.w) });
+  a.push({ key:"Outer Glass", value:u.outerGlass });
+  a.push({ key:"Inner Glass", value:u.innerGlass });
+
+  if (u.qty > 1)
+    a.push({ key:"Unit Price", value:fmtGBP(u.unitPrice) });
+
+  a.push({ key:"Line Total", value:fmtGBP(u.lineTotal) });
+  return a;
+}
+
+// Skylight — External added LAST
+function buildSkylightAttributes(u){
+  const a = [];
+
+  a.push({ key:"Calculator", value:"Skylight" });
+  a.push({ key:"Internal", value:dimsHW(u.h, u.w) });
+  a.push({ key:"Unit Strength", value:u.unitStrength });
+  a.push({ key:"Glazing", value:u.glazing });
+  a.push({ key:"Tint", value:u.tint });
+
+  if (String(u.solarControl).toLowerCase() === "yes")
+    a.push({ key:"Solar Control", value:"Yes" });
+
+  if (String(u.selfCleaning).toLowerCase() === "yes")
+    a.push({ key:"Self Cleaning", value:"Yes" });
+
+  if (u.qty > 1)
+    a.push({ key:"Unit Price", value:fmtGBP(u.unitPrice) });
+
+  a.push({ key:"Line Total", value:fmtGBP(u.lineTotal) });
+
+  // ✅ NEW — external ALWAYS LAST
+  if (Number.isFinite(u.extH) && Number.isFinite(u.extW)){
+    a.push({
+      key: "External",
+      value: dimsHW(u.extH, u.extW)
+    });
+  }
+
+  return a;
+}
+
+/* =========================
+   SHOPIFY GRAPHQL
+========================= */
+async function shopifyGraphql(query, variables){
   const res = await fetch(
-    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-01/graphql.json`,
+    `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-10/graphql.json`,
     {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
+      method:"POST",
+      headers:{
+        "Content-Type":"application/json",
+        "X-Shopify-Access-Token":SHOPIFY_ADMIN_ACCESS_TOKEN
       },
-      body: JSON.stringify({ query, variables }),
+      body:JSON.stringify({ query, variables })
     }
   );
-
   const json = await res.json();
-  if (!res.ok || json.errors) {
-    throw new Error(
-      `Shopify GraphQL error: ${JSON.stringify(json.errors || json)}`
-    );
-  }
+  if (!res.ok || json.errors) throw new Error(JSON.stringify(json.errors));
   return json.data;
 }
 
 /* =========================
-HELPERS
+   CHECKOUT
 ========================= */
-function pickAnchorVariant(type) {
-  return String(type).toLowerCase() === "skylight"
-    ? ANCHOR_VARIANT_GID_SKYLIGHT
-    : ANCHOR_VARIANT_GID_DGU;
-}
+app.post("/checkout", async (req,res)=>{
+  try{
+    requireValidSignature(req);
 
-function money(n) {
-  return Number(n).toFixed(2);
-}
+    const { calculatorType, units, totalUnitsQty } = req.body;
+    if (!units?.length) throw new Error("No units");
 
-/* =========================
-BUILD LINE ITEMS
-- DGU: unchanged (keeps Size first etc. as-is)
-- Skylight: updated order + Internal rename + hide Solar/Self when "No"
-========================= */
-function buildLineItems(calculatorType, units) {
-  const variantId = pickAnchorVariant(calculatorType);
-  const type = String(calculatorType).toUpperCase();
+    const isSkylight = calculatorType === "skylight";
+    const variantId = isSkylight
+      ? ANCHOR_VARIANT_GID_SKYLIGHT
+      : ANCHOR_VARIANT_GID_DGU;
 
-  return units.map((u) => {
-    const qty = Math.max(1, Number(u.qty) || 1);
-    const unitPrice = Number(u.unitPrice) || 0;
-
-    const customAttributes = [];
-
-    if (type === "DGU") {
-      // ✅ DGU SUMMARY UNCHANGED
-      customAttributes.push(
-        { key: "Size", value: `${u.heightMm}mm × ${u.widthMm}mm` },
-        { key: "Calculator", value: type },
-        { key: "Outer Glass", value: u.outerGlass },
-        { key: "Inner Glass", value: u.innerGlass },
-        { key: "Cavity", value: u.cavityWidth },
-        { key: "Spacer", value: u.spacer },
-        { key: "Self Cleaning", value: u.selfCleaning }
-      );
-    } else {
-      // ✅ SKYLIGHT SUMMARY UPDATED
-      // Order:
-      // Calculator
-      // Internal (height first)
-      // Unit Strength
-      // Glazing
-      // Tint
-      // Solar Control (omit if No)
-      // Self Cleaning (omit if No)
-
-      customAttributes.push({ key: "Calculator", value: "Skylight" });
-
-      customAttributes.push({
-        key: "Internal",
-        value: `${u.heightMm}mm × ${u.widthMm}mm`,
-      });
-
-      customAttributes.push(
-        { key: "Unit Strength", value: u.unitStrength },
-        { key: "Glazing", value: u.glazing },
-        { key: "Tint", value: u.tint }
-      );
-
-      if (String(u.solarControl) === "Yes") {
-        customAttributes.push({ key: "Solar Control", value: "Yes" });
-      }
-
-      if (String(u.selfCleaning) === "Yes") {
-        customAttributes.push({ key: "Self Cleaning", value: "Yes" });
-      }
-    }
-
-    return {
+    const lineItems = units.map(u=>({
       variantId,
-      quantity: qty,
-      originalUnitPrice: money(unitPrice),
-      customAttributes,
-    };
-  });
-}
+      quantity: u.qty,
+      priceOverride: money(u.unitPrice),
+      customAttributes: isSkylight
+        ? buildSkylightAttributes(u)
+        : buildDguAttributes(u)
+    }));
 
-/* =========================
-CHECKOUT
-========================= */
-app.post("/checkout", async (req, res) => {
-  try {
-    setCors(req, res);
-
-    const rawBody = req.body.toString("utf8");
-    if (!verifySignature(req, rawBody)) {
-      return res.status(401).json({ error: "Invalid signature" });
-    }
-
-    const payload = JSON.parse(rawBody);
-    const { calculatorType, units } = payload;
-
-    if (!Array.isArray(units) || units.length === 0) {
-      return res.status(400).json({ error: "No units supplied" });
-    }
-
-    const lineItems = buildLineItems(calculatorType, units);
-
-    const mutation = `
-      mutation draftOrderCreate($input: DraftOrderInput!) {
-        draftOrderCreate(input: $input) {
-          draftOrder {
-            id
-            invoiceUrl
-          }
-          userErrors { message }
-        }
-      }
-    `;
+    const grandTotal = grandTotalFromUnits(units);
 
     const input = {
-      lineItems,
+      note: "Created via RightGlaze calculator checkout",
       tags: [`calculator:${calculatorType}`],
+      presentmentCurrencyCode: PRESENTMENT_CURRENCY_CODE,
+      customAttributes: [
+        { key:"Calculator Type", value:calculatorType },
+        { key:"Total Units Qty", value:String(totalUnitsQty) },
+        { key:"Grand Total", value:fmtGBP(grandTotal) }
+      ],
+      lineItems
     };
 
-    const data = await shopifyGraphql(mutation, { input });
+    const data = await shopifyGraphql(
+      `mutation($input:DraftOrderInput!){
+        draftOrderCreate(input:$input){
+          draftOrder{ invoiceUrl }
+          userErrors{ message }
+        }
+      }`,
+      { input }
+    );
 
-    const errs = data?.draftOrderCreate?.userErrors || [];
-    if (errs.length) {
-      return res.status(400).json({ error: "Shopify error", details: errs });
-    }
+    const out = data.draftOrderCreate;
+    if (out.userErrors.length) throw new Error(out.userErrors[0].message);
 
-    const draft = data.draftOrderCreate.draftOrder;
-    if (!draft?.invoiceUrl) {
-      return res
-        .status(500)
-        .json({ error: "Checkout created but invoiceUrl missing" });
-    }
+    res.json({ invoiceUrl: out.draftOrder.invoiceUrl });
 
-    return res.json({ invoiceUrl: draft.invoiceUrl });
-  } catch (err) {
-    console.error("Server error", err);
-    res.status(500).json({ error: "Server error" });
+  }catch(e){
+    console.error(e);
+    res.status(500).json({ error:"Server error", reason:String(e.message||e) });
   }
 });
 
 /* =========================
-START
+   START
 ========================= */
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () =>
-  console.log(`RightGlaze checkout server running on ${PORT}`)
-);
+app.listen(PORT, ()=>console.log(`Server running on ${PORT}`));
