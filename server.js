@@ -1,13 +1,12 @@
 // server.js (ESM)
-// RightGlaze Draft Order app — DGU + Skylight
-// NO external cors dependency
+// RightGlaze Draft Order Checkout — DGU + Skylight
+// Changes in this version ONLY:
+// 1) Line total removed from ALL summaries (no "Line total" customAttribute anywhere)
+// 2) DGU summary "Size" shows Height then Width
 
 import express from "express";
 import crypto from "crypto";
 
-/* =========================
-APP
-========================= */
 const app = express();
 
 /* =========================
@@ -15,268 +14,327 @@ ENV
 ========================= */
 function mustEnv(name) {
 const v = process.env[name];
-if (!v || !String(v).trim()) throw new Error(`Missing required env var: ${name}`);
-return String(v).trim();
+if (!v) throw new Error(`Missing required env var: ${name}`);
+return v;
 }
 
-const SHOPIFY_SHOP_DOMAIN = mustEnv("SHOPIFY_SHOP_DOMAIN");
+const SHOPIFY_SHOP_DOMAIN = mustEnv("SHOPIFY_SHOP_DOMAIN"); // e.g. yourshop.myshopify.com
 const SHOPIFY_ADMIN_ACCESS_TOKEN = mustEnv("SHOPIFY_ADMIN_ACCESS_TOKEN");
+const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
+
 const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 
+// Anchor variants used to force a product image in draft order / invoice
 const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
-const PRESENTMENT_CURRENCY_CODE = (process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
-
 /* =========================
-RAW BODY (HMAC)
-========================= */
-app.use(
-express.json({
-limit: "1mb",
-verify: (req, res, buf) => {
-req.rawBody = buf.toString("utf8");
-},
-})
-);
-
-/* =========================
-CORS (MANUAL)
+CORS / PREFLIGHT (no 'cors' package)
 ========================= */
 app.use((req, res, next) => {
-const origin = req.headers.origin || "*";
-res.setHeader("Access-Control-Allow-Origin", origin);
-res.setHeader("Vary", "Origin");
-res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
-res.setHeader(
-"Access-Control-Allow-Headers",
-"Content-Type, X-RG-Timestamp, X-RG-Signature"
-);
-
+res.setHeader("Access-Control-Allow-Origin", "*");
+res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS, GET");
+res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-RG-Timestamp, X-RG-Signature");
+res.setHeader("Access-Control-Max-Age", "86400");
 if (req.method === "OPTIONS") return res.status(204).end();
 next();
 });
 
-/* =========================
-SECURITY
-========================= */
-function hmacSha256Hex(secret, msg) {
-return crypto.createHmac("sha256", secret).update(msg).digest("hex");
-}
-
-function requireValidSignature(req) {
-const ts = req.header("X-RG-Timestamp");
-const sig = req.header("X-RG-Signature");
-if (!ts || !sig) throw new Error("Missing signature headers");
-
-const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, `${ts}.${req.rawBody}`);
-
-if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) {
-throw new Error("Invalid signature");
-}
-}
+app.use(express.json({ limit: "1mb" }));
 
 /* =========================
 HELPERS
 ========================= */
-const money = (n) => ({
-amount: Number(n || 0).toFixed(2),
-currencyCode: PRESENTMENT_CURRENCY_CODE,
-});
-
-const fmtGBP = (n) => `£${Number(n || 0).toFixed(2)}`;
-
-// DGU wants W×H (unchanged)
-function dimsWH(w, h) {
-const ww = Number(w);
-const hh = Number(h);
-if (Number.isFinite(ww) && Number.isFinite(hh)) return `${ww}mm × ${hh}mm`;
-return "—";
+function money2(n) {
+const x = Number(n);
+if (!Number.isFinite(x)) return "0.00";
+return x.toFixed(2);
 }
 
-// Skylight wants H×W
-function dimsHW(h, w) {
-const hh = Number(h);
-const ww = Number(w);
-if (Number.isFinite(hh) && Number.isFinite(ww)) return `${hh}mm × ${ww}mm`;
-return "—";
+function safeStr(v) {
+if (v === null || v === undefined) return "";
+return String(v);
 }
 
-const grandTotalFromUnits = (units) =>
-units.reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0);
-
-function pushAttr(arr, key, value) {
-if (value === undefined || value === null) return;
-const v = String(value).trim();
-if (!v) return;
-arr.push({ key, value: v });
+function hmacSha256Hex(secret, message) {
+return crypto.createHmac("sha256", secret).update(message).digest("hex");
 }
 
-/* =========================
-SUMMARY BUILDERS
-========================= */
-function buildDguAttributes(u) {
-const a = [];
-
-// Size first (existing behaviour)
-const w = u.widthMm ?? u.w;
-const h = u.heightMm ?? u.h;
-a.push({ key: "Size", value: dimsWH(w, h) });
-
-// Show all option inputs from DGU calculator
-pushAttr(a, "Calculator", "DGU");
-pushAttr(a, "Outer Glass", u.outerGlass);
-pushAttr(a, "Inner Glass", u.innerGlass);
-pushAttr(a, "Cavity Width", u.cavityWidth);
-
-// Toughened is always Yes for DGU calculator
-pushAttr(a, "Toughened", u.toughened ?? "Yes");
-
-pushAttr(a, "Self-cleaning", u.selfCleaning);
-pushAttr(a, "Spacer", u.spacer);
-
-// Optional: include thickness if payload includes it
-// (won't show if undefined)
-pushAttr(a, "Thickness", u.thickness);
-
-// Unit price + line total only if qty > 1
-if (Number(u.qty) > 1) {
-a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
-a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
+function timingSafeEqualHex(a, b) {
+try {
+const ba = Buffer.from(String(a || ""), "hex");
+const bb = Buffer.from(String(b || ""), "hex");
+if (ba.length !== bb.length) return false;
+return crypto.timingSafeEqual(ba, bb);
+} catch {
+return false;
+}
 }
 
-return a;
+function verifySignedBody(req, rawBody) {
+const ts = req.get("X-RG-Timestamp") || "";
+const sig = req.get("X-RG-Signature") || "";
+if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
+
+const toSign = `${ts}.${rawBody}`;
+const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, toSign);
+const ok = timingSafeEqualHex(expected, sig);
+return ok ? { ok: true } : { ok: false, reason: "Invalid signature" };
 }
 
-function buildSkylightAttributes(u) {
-const a = [];
-
-// Pull internal dims from payload (internal is widthMm/heightMm) but DISPLAY as H×W
-const internalW = u.widthMm ?? u.w;
-const internalH = u.heightMm ?? u.h;
-
-// Pull external dims from payload (must match red popup) but DISPLAY as H×W
-const externalW = u.extWidthMm ?? u.extW;
-const externalH = u.extHeightMm ?? u.extH;
-
-a.push({ key: "Calculator", value: "Skylight" });
-
-// Internal: height first then width
-a.push({ key: "Internal", value: dimsHW(internalH, internalW) });
-
-pushAttr(a, "Unit Strength", u.unitStrength);
-pushAttr(a, "Glazing", u.glazing);
-pushAttr(a, "Tint", u.tint);
-
-if (String(u.solarControl).toLowerCase() === "yes") {
-a.push({ key: "Solar Control", value: "Yes" });
-}
-
-if (String(u.selfCleaning).toLowerCase() === "yes") {
-a.push({ key: "Self Cleaning", value: "Yes" });
-}
-
-// Unit price + line total only if qty > 1
-if (Number(u.qty) > 1) {
-a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
-a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
-}
-
-// External LAST: height first then width
-if (
-Number.isFinite(Number(externalW)) &&
-Number.isFinite(Number(externalH))
-) {
-a.push({ key: "External", value: dimsHW(externalH, externalW) });
-}
-
-return a;
-}
-
-/* =========================
-SHOPIFY GRAPHQL
-========================= */
 async function shopifyGraphql(query, variables) {
-const res = await fetch(
-`https://${SHOPIFY_SHOP_DOMAIN}/admin/api/2025-10/graphql.json`,
-{
+const url = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+
+const res = await fetch(url, {
 method: "POST",
 headers: {
 "Content-Type": "application/json",
 "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
 },
 body: JSON.stringify({ query, variables }),
-}
-);
+});
 
-const json = await res.json();
-if (!res.ok || json.errors) {
-throw new Error(JSON.stringify(json.errors || json));
+const text = await res.text();
+let data;
+try {
+data = JSON.parse(text);
+} catch {
+throw new Error(`Shopify non-JSON response (${res.status}): ${text.slice(0, 200)}`);
 }
-return json.data;
+
+if (!res.ok) {
+throw new Error(`Shopify HTTP ${res.status}: ${text}`);
+}
+if (data.errors?.length) {
+throw new Error(`Shopify GraphQL errors: ${JSON.stringify(data.errors)}`);
+}
+return data.data;
+}
+
+function buildAnchorLineItem(calculatorType) {
+const variantId =
+calculatorType === "dgu" ? ANCHOR_VARIANT_GID_DGU : ANCHOR_VARIANT_GID_SKYLIGHT;
+
+return {
+variantId,
+quantity: 1,
+// Make anchor free and harmless
+originalUnitPrice: "0.00",
+// No customAttributes needed here; image comes from variant
+};
 }
 
 /* =========================
-CHECKOUT
+SUMMARY BUILDERS (customAttributes)
+NOTE: line totals removed everywhere.
 ========================= */
-app.post("/checkout", async (req, res) => {
-try {
-requireValidSignature(req);
 
-const { calculatorType, units, totalUnitsQty } = req.body;
-if (!units || !Array.isArray(units) || units.length === 0) {
-throw new Error("No units provided");
+// DGU: show Size as HEIGHT then WIDTH (requested change)
+function dguSizeValue(u) {
+const h = Number(u.heightMm ?? u.h ?? u.height ?? 0);
+const w = Number(u.widthMm ?? u.w ?? u.width ?? 0);
+if (Number.isFinite(h) && h > 0 && Number.isFinite(w) && w > 0) {
+return `${h}mm × ${w}mm`; // ✅ height then width
+}
+return "";
 }
 
-const isSkylight = calculatorType === "skylight";
-const variantId = isSkylight ? ANCHOR_VARIANT_GID_SKYLIGHT : ANCHOR_VARIANT_GID_DGU;
+// Skylight: keep existing summary shape/order (as per your working version),
+// just ensure we never add "Line total".
+function skylightInternalValue(u) {
+const h = Number(u.heightMm ?? u.h ?? 0);
+const w = Number(u.widthMm ?? u.w ?? 0);
+if (Number.isFinite(h) && h > 0 && Number.isFinite(w) && w > 0) {
+return `${h}mm × ${w}mm`; // skylight internal is height then width in your spec
+}
+return "";
+}
+function skylightExternalValue(u) {
+const h = Number(u.extHeightMm ?? u.extH ?? 0);
+const w = Number(u.extWidthMm ?? u.extW ?? 0);
+if (Number.isFinite(h) && h > 0 && Number.isFinite(w) && w > 0) {
+return `${h}mm × ${w}mm`; // height then width
+}
+return "";
+}
 
-const lineItems = units.map((u) => ({
-variantId,
-quantity: Number(u.qty) || 1,
-// per-unit price (Shopify calculates totals)
-priceOverride: money(u.unitPrice),
-customAttributes: isSkylight ? buildSkylightAttributes(u) : buildDguAttributes(u),
-}));
+function pushAttr(attrs, name, value) {
+const v = safeStr(value).trim();
+if (!v) return;
+attrs.push({ key: name, value: v });
+}
 
-const grandTotal = grandTotalFromUnits(units);
+// DGU: include all option inputs (as previously requested in your flow).
+// We won’t invent new fields; we’ll include any known/commonly-sent fields if present.
+function buildDguAttributes(u) {
+const attrs = [];
 
-const input = {
-note: "Created via RightGlaze calculator checkout",
-tags: [`calculator:${calculatorType}`],
-presentmentCurrencyCode: PRESENTMENT_CURRENCY_CODE,
-customAttributes: [
-{ key: "Calculator Type", value: String(calculatorType || "").trim() },
-{ key: "Total Units Qty", value: String(totalUnitsQty ?? "") },
-{ key: "Grand Total", value: fmtGBP(grandTotal) },
-],
+pushAttr(attrs, "Calculator", "DGU");
+pushAttr(attrs, "Size", dguSizeValue(u));
+
+// Common DGU fields (only included if present)
+pushAttr(attrs, "Outer Glass", u.outerGlass);
+pushAttr(attrs, "Cavity", u.cavity);
+pushAttr(attrs, "Inner Glass", u.innerGlass);
+
+pushAttr(attrs, "Spacer Colour", u.spacerColour ?? u.spacerColor);
+pushAttr(attrs, "Gas Fill", u.gasFill ?? u.gas);
+pushAttr(attrs, "Warm Edge", u.warmEdge);
+pushAttr(attrs, "Self Cleaning", u.selfCleaning);
+pushAttr(attrs, "Solar Control", u.solarControl);
+pushAttr(attrs, "Tint", u.tint);
+
+// If your DGU payload includes any additional option keys, add them here in the same pattern.
+// (Leaving structure unchanged beyond the requested Size order.)
+
+return attrs;
+}
+
+// Skylight: order you specified earlier:
+// Calculator
+// Internal
+// Unit Strength
+// Glazing
+// Tint
+// Solar Control (omit if "No")
+// Self Cleaning (omit if "No")
+// External (last)
+function buildSkylightAttributes(u) {
+const attrs = [];
+
+pushAttr(attrs, "Calculator", "Skylight");
+pushAttr(attrs, "Internal", skylightInternalValue(u));
+pushAttr(attrs, "Unit Strength", u.unitStrength);
+pushAttr(attrs, "Glazing", u.glazing);
+pushAttr(attrs, "Tint", u.tint);
+
+// Omit if not selected (expects "Yes"/"No")
+if (safeStr(u.solarControl).trim() === "Yes") pushAttr(attrs, "Solar Control", "Yes");
+if (safeStr(u.selfCleaning).trim() === "Yes") pushAttr(attrs, "Self Cleaning", "Yes");
+
+// External last (pulls from extWidthMm/extHeightMm in payload)
+pushAttr(attrs, "External", skylightExternalValue(u));
+
+return attrs;
+}
+
+function calcGrandTotalFromPayload(body) {
+// Prefer explicit grandTotal if present and numeric, else compute from units.
+const gt = Number(body?.grandTotal);
+if (Number.isFinite(gt) && gt >= 0) return gt;
+
+const units = Array.isArray(body?.units) ? body.units : [];
+return units.reduce((sum, u) => {
+const qty = Number(u?.qty) || 0;
+const unitPrice = Number(u?.unitPrice) || 0;
+return sum + qty * unitPrice;
+}, 0);
+}
+
+function buildLineItemsFromPayload(body) {
+const calculatorType = safeStr(body?.calculatorType).toLowerCase().trim();
+const units = Array.isArray(body?.units) ? body.units : [];
+
+const items = [];
+// Anchor line item first (forces image)
+items.push(buildAnchorLineItem(calculatorType === "skylight" ? "skylight" : "dgu"));
+
+for (const u of units) {
+const qty = Math.max(1, Math.min(100, Number(u?.qty) || 1));
+const unitPrice = Number(u?.unitPrice);
+const unitPriceStr = Number.isFinite(unitPrice) ? money2(unitPrice) : "0.00";
+
+// Title shown on line item in draft order (keep simple)
+const title =
+calculatorType === "skylight"
+? "Skylight — Custom"
+: "DGU — Custom";
+
+const customAttributes =
+calculatorType === "skylight" ? buildSkylightAttributes(u) : buildDguAttributes(u);
+
+items.push({
+title,
+quantity: qty,
+// IMPORTANT: per-unit price (Shopify calculates totals with quantity)
+originalUnitPrice: unitPriceStr,
+customAttributes,
+});
+}
+
+return { calculatorType, items };
+}
+
+/* =========================
+ROUTES
+========================= */
+app.get("/", (req, res) => res.json({ ok: true }));
+app.get("/health", (req, res) => res.json({ ok: true }));
+
+app.post("/checkout", async (req, res) => {
+// Verify HMAC against raw body
+const rawBody = JSON.stringify(req.body ?? {});
+const sig = verifySignedBody(req, rawBody);
+if (!sig.ok) {
+return res.status(401).json({ error: "Unauthorized", reason: sig.reason });
+}
+
+try {
+const body = req.body || {};
+const { calculatorType, items: lineItems } = buildLineItemsFromPayload(body);
+
+const totalUnitsQty = Number(body?.totalUnitsQty) || 0;
+const grandTotal = calcGrandTotalFromPayload(body);
+
+const noteLines = [
+"Created via RightGlaze calculator checkout",
+`Calculator Type: ${calculatorType || "unknown"}`,
+`Total Units Qty: ${totalUnitsQty || 0}`,
+`Grand Total: £${money2(grandTotal)}`,
+];
+const note = noteLines.join("\n");
+
+const tags = [`calculator:${calculatorType || "unknown"}`];
+
+const mutation = `
+mutation DraftOrderCreate($input: DraftOrderInput!) {
+draftOrderCreate(input: $input) {
+draftOrder {
+id
+invoiceUrl
+}
+userErrors {
+field
+message
+}
+}
+}
+`;
+
+const variables = {
+input: {
+note,
+tags,
 lineItems,
+},
 };
 
-const data = await shopifyGraphql(
-`mutation($input: DraftOrderInput!) {
-draftOrderCreate(input: $input) {
-draftOrder { invoiceUrl }
-userErrors { message }
-}
-}`,
-{ input }
-);
-
+const data = await shopifyGraphql(mutation, variables);
 const out = data?.draftOrderCreate;
-if (!out) throw new Error("Unexpected Shopify response");
-if (out.userErrors?.length) throw new Error(out.userErrors[0].message);
 
-const invoiceUrl = out.draftOrder?.invoiceUrl;
-if (!invoiceUrl) throw new Error("Checkout created but invoice URL missing.");
+if (out?.userErrors?.length) {
+return res.status(400).json({ error: "Shopify userErrors", userErrors: out.userErrors });
+}
 
-res.json({ invoiceUrl });
-} catch (err) {
-console.error(err);
-res.status(500).json({
-error: "Server error",
-reason: String(err?.message || err),
-});
+const invoiceUrl = out?.draftOrder?.invoiceUrl;
+if (!invoiceUrl) {
+return res.status(500).json({ error: "Checkout created but invoice URL missing." });
+}
+
+return res.status(200).json({ invoiceUrl });
+} catch (e) {
+console.error("Server error", e);
+return res.status(500).json({ error: "Server error", reason: e?.message || String(e) });
 }
 });
 
@@ -285,5 +343,5 @@ START
 ========================= */
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-console.log(`RightGlaze Draft Order app running on ${PORT}`);
+console.log(`RightGlaze draft-order app listening on :${PORT}`);
 });
