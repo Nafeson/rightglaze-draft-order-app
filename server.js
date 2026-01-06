@@ -34,7 +34,6 @@ const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
 function setCors(req, res) {
   const origin = req.headers.origin;
 
-  // If ALLOWED_ORIGINS not set, reflect origin (useful for Shopify storefront embeds)
   const allow =
     allowedOrigins.length === 0
       ? origin
@@ -66,14 +65,8 @@ app.use((req, res, next) => {
 // =====================
 // RAW BODY CAPTURE (CRITICAL FOR HMAC)
 // =====================
-// We only need raw for /checkout, so we mount a raw parser there.
-// Then we parse JSON ourselves so we keep the raw string exactly as signed.
-app.post(
-  "/checkout",
-  express.raw({ type: "application/json", limit: "1mb" })
-);
+app.post("/checkout", express.raw({ type: "application/json", limit: "1mb" }));
 
-// Helper to parse JSON from raw buffer safely
 function parseJsonRaw(buf) {
   try {
     const s = Buffer.isBuffer(buf) ? buf.toString("utf8") : String(buf || "");
@@ -171,15 +164,30 @@ async function fetchInvoiceUrlWithRetry(draftOrderGid, attempts = 10, delayMs = 
 }
 
 // =====================
-// BUILD LINE ITEMS
+// LINE ITEMS (IMPORTANT FIX)
 // =====================
+// Shopify checkout only shows images for VARIANT line items.
+// Custom line items (title/price) will always show a grey placeholder.
+// So: create EACH unit as a variant line item (anchor variant), and put
+// the unit summary into customAttributes (line item properties).
 function pickAnchorVariant(calculatorType) {
   const t = String(calculatorType || "").toLowerCase();
   if (t === "skylight") return ANCHOR_VARIANT_GID_SKYLIGHT;
   return ANCHOR_VARIANT_GID_DGU;
 }
 
-function titleForUnit(calculatorType, u) {
+function capLabel(s) {
+  const x = String(s || "").trim();
+  if (!x) return "";
+  return x.charAt(0).toUpperCase() + x.slice(1);
+}
+
+function formatMoney(n) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v.toFixed(2) : "0.00";
+}
+
+function buildUnitSummaryString(calculatorType, u) {
   const t = String(calculatorType || "").toLowerCase();
 
   if (t === "skylight") {
@@ -187,43 +195,57 @@ function titleForUnit(calculatorType, u) {
     const glazing = u.glazing ? String(u.glazing) : "—";
     const w = Number(u.widthMm);
     const h = Number(u.heightMm);
-    const qty = Number(u.qty) || 1;
-    const dims = (Number.isFinite(w) && Number.isFinite(h)) ? `${w}mm × ${h}mm` : "—";
-    return `Skylight — ${strength} / ${glazing} — ${dims} (Internal) — Qty ${qty}`;
+    const extW = Number(u.extWidthMm);
+    const extH = Number(u.extHeightMm);
+
+    const internal = (Number.isFinite(w) && Number.isFinite(h)) ? `${w}×${h}mm` : "—";
+    const external = (Number.isFinite(extW) && Number.isFinite(extH)) ? `${extW}×${extH}mm` : "—";
+
+    const tint = u.tint ? String(u.tint) : "—";
+    const solar = u.solarControl ? String(u.solarControl) : "—";
+    const sc = u.selfCleaning ? String(u.selfCleaning) : "—";
+
+    return `${strength} • ${glazing} • Internal ${internal} • External ${external} • Tint ${tint} • Solar Control ${solar} • Self Cleaning ${sc}`;
   }
 
+  // DGU
   const outer = u.outerGlass ? String(u.outerGlass) : "—";
   const inner = u.innerGlass ? String(u.innerGlass) : "—";
+  const cavity = u.cavityWidth ? String(u.cavityWidth) : "—";
   const w = Number(u.widthMm);
   const h = Number(u.heightMm);
-  const qty = Number(u.qty) || 1;
-  const dims = (Number.isFinite(w) && Number.isFinite(h)) ? `${w}mm × ${h}mm` : "—";
-  return `DGU — ${outer} / ${inner} — ${dims} — Qty ${qty}`;
+  const dims = (Number.isFinite(w) && Number.isFinite(h)) ? `${w}×${h}mm` : "—";
+  const spacer = u.spacer ? String(u.spacer) : "—";
+  const sc = u.selfCleaning ? String(u.selfCleaning) : "—";
+
+  return `Outer ${outer} • Inner ${inner} • Cavity ${cavity} • ${dims} • Spacer ${spacer} • Self Cleaning ${sc}`;
 }
 
 function buildDraftOrderLineItems({ calculatorType, units }) {
-  const anchorVariantId = pickAnchorVariant(calculatorType);
-  const items = [];
+  const variantId = pickAnchorVariant(calculatorType);
 
-  // Anchor item -> forces product image/title in checkout
-  items.push({
-    variantId: anchorVariantId,
-    quantity: 1,
-    originalUnitPrice: "0.00",
-  });
+  return (units || []).map((u) => {
+    const lineTotal = Number(u.lineTotal) || 0;
+    const unitPrice = Number(u.unitPrice) || 0;
+    const qty = Number(u.qty) || 1;
 
-  for (const u of units || []) {
-    const lineTotal = Number(u.lineTotal);
-    const priced = Number.isFinite(lineTotal) ? lineTotal : 0;
+    // These become “line item properties” in Shopify.
+    // They are shown underneath the item on draft invoice/checkout.
+    const customAttributes = [
+      { key: "Calculator", value: capLabel(calculatorType) }, // Capitalised
+      { key: "Qty", value: String(qty) },
+      { key: "Unit Price", value: `£${formatMoney(unitPrice)}` },
+      { key: "Line Total", value: `£${formatMoney(lineTotal)}` },
+      { key: "Summary", value: buildUnitSummaryString(calculatorType, u) },
+    ];
 
-    items.push({
-      title: titleForUnit(calculatorType, u),
+    return {
+      variantId,
       quantity: 1,
-      originalUnitPrice: priced.toFixed(2),
-    });
-  }
-
-  return items;
+      originalUnitPrice: formatMoney(lineTotal),
+      customAttributes,
+    };
+  });
 }
 
 // =====================
@@ -260,6 +282,10 @@ app.post("/checkout", async (req, res) => {
     const calculatorType = body?.calculatorType || "dgu";
     const units = Array.isArray(body?.units) ? body.units : [];
 
+    if (!units.length) {
+      return res.status(400).json({ error: "No units provided", reason: "units_empty", reqId });
+    }
+
     const payloadGrandTotal = Number(body?.grandTotal);
     const computedGrandTotal = units.reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0);
     const grandTotal = Number.isFinite(payloadGrandTotal) ? payloadGrandTotal : computedGrandTotal;
@@ -270,8 +296,7 @@ app.post("/checkout", async (req, res) => {
 
     const lineItems = buildDraftOrderLineItems({ calculatorType, units });
 
-    // ✅ FIX: DraftOrderInput does NOT support noteAttributes.
-    // Persist metadata into the draft order note string (always supported).
+    // Persist calculator metadata in Draft Order NOTE (safe across API versions)
     const noteLines = [
       "Created via RightGlaze calculator checkout",
       `Calculator Type: ${String(calculatorType)}`,
