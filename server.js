@@ -1,369 +1,397 @@
 /**
- * RightGlaze Draft Order Checkout Server (Render / Node 18+)
- *
- * What this does:
- * - Receives calculator payloads from your Shopify product-page calculators
- * - Verifies HMAC signature (FRONTEND_SHARED_SECRET) to prevent tampering
- * - Creates a Shopify Draft Order using an "anchor" variant so checkout shows the correct product image/title
- * - Pushes GRAND TOTAL to checkout by overriding the anchor line item price to the calculator grand total
- * - Stores full breakdown in Draft Order note + custom attributes (with Capitalised labels)
- *
- * Required env vars (Render -> Environment):
- * - SHOPIFY_SHOP_DOMAIN             e.g. rightglaze.myshopify.com  (NO https)
- * - SHOPIFY_ADMIN_ACCESS_TOKEN      shpat_...
- * - FRONTEND_SHARED_SECRET          must match the calculators
- * - DGU_ANCHOR_VARIANT_GID          gid://shopify/ProductVariant/...
- * - SKYLIGHT_ANCHOR_VARIANT_GID     gid://shopify/ProductVariant/...
- *
- * Optional:
- * - SHOPIFY_API_VERSION             e.g. 2024-10 (default below)
- * - PORT                            (Render sets this)
- */
+* RightGlaze Draft Order App (server.js)
+* - Receives calculator payloads (dgu / skylight)
+* - Verifies HMAC (timestamp.body)
+* - Creates Shopify Draft Order with:
+* ✅ correct anchor variant per calculatorType (so image/title show)
+* ✅ customAttributes + note storing calculator grandTotal
+* ✅ line items for each confirmed unit (priced)
+*
+* IMPORTANT ENV VARS (Render → Environment):
+* - SHOPIFY_ADMIN_ACCESS_TOKEN (required) // Admin API access token
+* - SHOPIFY_SHOP_DOMAIN (required) // e.g. rightglaze.myshopify.com
+* (Alias supported: SHOPIFY_SHOP)
+* - FRONTEND_SHARED_SECRET (required) // must match calculators
+* - ANCHOR_VARIANT_GID_DGU (required) // gid://shopify/ProductVariant/...
+* - ANCHOR_VARIANT_GID_SKYLIGHT (required) // gid://shopify/ProductVariant/...
+* - SHOPIFY_API_VERSION (optional) // default 2024-07
+*
+* OPTIONAL:
+* - ALLOWED_ORIGINS (comma separated) for CORS
+*/
 
 import express from "express";
 import crypto from "crypto";
 
 const app = express();
 
-/* ----------------------------- ENV + VALIDATION ---------------------------- */
-
-function mustEnv(name, value) {
-  if (!value || String(value).trim() === "") {
-    throw new Error(`Missing required env var: ${name}`);
-  }
+/* ---------- Helpers ---------- */
+function mustEnv(name, { allowEmpty = false } = {}) {
+const v = process.env[name];
+if (v === undefined || (!allowEmpty && String(v).trim() === "")) {
+throw new Error(`Missing required env var: ${name}`);
+}
+return v;
 }
 
-const SHOPIFY_SHOP_DOMAIN = process.env.SHOPIFY_SHOP_DOMAIN;
-const SHOPIFY_ADMIN_ACCESS_TOKEN = process.env.SHOPIFY_ADMIN_ACCESS_TOKEN;
-const FRONTEND_SHARED_SECRET = process.env.FRONTEND_SHARED_SECRET;
-
-const DGU_ANCHOR_VARIANT_GID = process.env.DGU_ANCHOR_VARIANT_GID;
-const SKYLIGHT_ANCHOR_VARIANT_GID = process.env.SKYLIGHT_ANCHOR_VARIANT_GID;
-
-const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || "2024-10";
-
-mustEnv("SHOPIFY_SHOP_DOMAIN", SHOPIFY_SHOP_DOMAIN);
-mustEnv("SHOPIFY_ADMIN_ACCESS_TOKEN", SHOPIFY_ADMIN_ACCESS_TOKEN);
-mustEnv("FRONTEND_SHARED_SECRET", FRONTEND_SHARED_SECRET);
-mustEnv("DGU_ANCHOR_VARIANT_GID", DGU_ANCHOR_VARIANT_GID);
-mustEnv("SKYLIGHT_ANCHOR_VARIANT_GID", SKYLIGHT_ANCHOR_VARIANT_GID);
-
-/* ----------------------------- BODY (RAW CAPTURE) -------------------------- */
-/**
- * We need the raw JSON string exactly as sent so that:
- * signature = HMAC_SHA256(secret, `${timestamp}.${rawBody}`)
- */
-app.use(
-  express.json({
-    limit: "1mb",
-    verify: (req, _res, buf) => {
-      req.rawBody = buf?.toString("utf8") || "";
-    },
-  })
-);
-
-/* ----------------------------- CORS (simple) ------------------------------- */
-/**
- * If you're calling this from Shopify storefront, allow it.
- * If you want to lock it down further, restrict origins to your domains.
- */
-app.use((req, res, next) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-RG-Timestamp, X-RG-Signature");
-  res.setHeader("Access-Control-Allow-Methods", "POST, GET, OPTIONS");
-  if (req.method === "OPTIONS") return res.sendStatus(204);
-  next();
-});
-
-/* -------------------------------- UTILITIES -------------------------------- */
-
-function safeNum(n, fallback = 0) {
-  const x = typeof n === "string" ? Number(n) : n;
-  return Number.isFinite(x) ? x : fallback;
+function getEnv(name, fallback = "") {
+const v = process.env[name];
+return (v === undefined || String(v).trim() === "") ? fallback : v;
 }
 
-function clamp(n, min, max) {
-  return Math.min(max, Math.max(min, n));
+function asNumber(x, fallback = 0) {
+const n = Number(x);
+return Number.isFinite(n) ? n : fallback;
 }
 
-function money2(n) {
-  return (Math.round(safeNum(n, 0) * 100) / 100).toFixed(2);
+function moneyGBP(n) {
+const v = asNumber(n, 0);
+return `£${v.toFixed(2)}`;
 }
 
-function hmacHex(secret, message) {
-  return crypto.createHmac("sha256", secret).update(message, "utf8").digest("hex");
+function safeStr(x) {
+if (x === null || x === undefined) return "";
+return String(x);
 }
 
-function timingSafeEqualHex(a, b) {
-  try {
-    const ab = Buffer.from(String(a || ""), "hex");
-    const bb = Buffer.from(String(b || ""), "hex");
-    if (ab.length !== bb.length) return false;
-    return crypto.timingSafeEqual(ab, bb);
-  } catch {
-    return false;
-  }
-}
-
-function titleCaseLabel(s) {
-  // For keys like "outerGlass" or "extWidthMm" -> "Outer Glass" / "Ext Width Mm"
-  const str = String(s || "");
-  if (!str) return "";
-  const spaced = str
-    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
-    .replace(/_/g, " ")
-    .trim();
-  return spaced
-    .split(/\s+/)
-    .map((w) => (w ? w[0].toUpperCase() + w.slice(1) : ""))
-    .join(" ");
-}
-
-function toCustomAttributes(obj, allowKeys = null) {
-  // Shopify DraftOrder customAttributes: [{ key, value }]
-  if (!obj || typeof obj !== "object") return [];
-  const out = [];
-  for (const [k, v] of Object.entries(obj)) {
-    if (allowKeys && !allowKeys.has(k)) continue;
-    if (v === undefined || v === null) continue;
-    const key = titleCaseLabel(k);
-    const value = String(v);
-    if (!key || !value) continue;
-    out.push({ key, value });
-  }
-  // Shopify has practical limits; keep it sane
-  return out.slice(0, 40);
+function normalizeCalculatorType(x) {
+const t = String(x || "").toLowerCase().trim();
+if (t === "skylight") return "skylight";
+return "dgu"; // default
 }
 
 function calcGrandTotalFromUnits(units) {
-  return (Array.isArray(units) ? units : []).reduce((sum, u) => {
-    const lineTotal = safeNum(u?.lineTotal, safeNum(u?.unitPrice, 0) * safeNum(u?.qty, 1));
-    return sum + (Number.isFinite(lineTotal) ? lineTotal : 0);
-  }, 0);
+if (!Array.isArray(units)) return 0;
+return units.reduce((sum, u) => sum + asNumber(u?.lineTotal, 0), 0);
 }
 
-/* ------------------------------ SHOPIFY GRAPHQL ---------------------------- */
+/* ---------- ENV (with backwards-compatible alias) ---------- */
+const SHOP_DOMAIN = getEnv("SHOPIFY_SHOP_DOMAIN", getEnv("SHOPIFY_SHOP", ""));
+if (!SHOP_DOMAIN) {
+// keep the same error you were seeing, but allow the alias
+throw new Error("Missing required env var: SHOPIFY_SHOP_DOMAIN");
+}
+const ADMIN_TOKEN = mustEnv("SHOPIFY_ADMIN_ACCESS_TOKEN");
+const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 
-const SHOPIFY_GRAPHQL_URL = `https://${SHOPIFY_SHOP_DOMAIN}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`;
+const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
+const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
+const API_VERSION = getEnv("SHOPIFY_API_VERSION", "2024-07");
+
+/* ---------- Middleware ---------- */
+app.use(express.json({ limit: "1mb" }));
+
+// Basic CORS (optional hardening)
+const allowedOrigins = getEnv("ALLOWED_ORIGINS", "")
+.split(",")
+.map(s => s.trim())
+.filter(Boolean);
+
+app.use((req, res, next) => {
+const origin = req.headers.origin;
+if (!origin) return next();
+
+if (allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+res.setHeader("Access-Control-Allow-Origin", origin);
+res.setHeader("Vary", "Origin");
+res.setHeader("Access-Control-Allow-Headers", "Content-Type, X-RG-Timestamp, X-RG-Signature");
+res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+}
+
+if (req.method === "OPTIONS") return res.sendStatus(204);
+next();
+});
+
+/* ---------- HMAC verification ---------- */
+function hmacSha256Hex(secret, message) {
+return crypto.createHmac("sha256", secret).update(message).digest("hex");
+}
+
+function timingSafeEqualHex(a, b) {
+try {
+const ab = Buffer.from(String(a || ""), "hex");
+const bb = Buffer.from(String(b || ""), "hex");
+if (ab.length !== bb.length) return false;
+return crypto.timingSafeEqual(ab, bb);
+} catch {
+return false;
+}
+}
+
+function verifySignedRequest(req) {
+const ts = req.header("X-RG-Timestamp");
+const sig = req.header("X-RG-Signature");
+if (!ts || !sig) return { ok: false, reason: "Missing signature headers" };
+
+// Optional replay window (10 minutes)
+const now = Date.now();
+const tsNum = Number(ts);
+if (!Number.isFinite(tsNum)) return { ok: false, reason: "Invalid timestamp" };
+if (Math.abs(now - tsNum) > 10 * 60 * 1000) return { ok: false, reason: "Timestamp outside window" };
+
+const rawBody = JSON.stringify(req.body ?? {});
+const toSign = `${ts}.${rawBody}`;
+const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, toSign);
+const ok = timingSafeEqualHex(expected, sig);
+return ok ? { ok: true } : { ok: false, reason: "Bad signature" };
+}
+
+/* ---------- Shopify GraphQL ---------- */
 async function shopifyGraphQL(query, variables) {
-  const resp = await fetch(SHOPIFY_GRAPHQL_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Shopify-Access-Token": SHOPIFY_ADMIN_ACCESS_TOKEN,
-    },
-    body: JSON.stringify({ query, variables }),
-  });
+const url = `https://${SHOP_DOMAIN}/admin/api/${API_VERSION}/graphql.json`;
 
-  const json = await resp.json().catch(() => null);
+const res = await fetch(url, {
+method: "POST",
+headers: {
+"Content-Type": "application/json",
+"X-Shopify-Access-Token": ADMIN_TOKEN
+},
+body: JSON.stringify({ query, variables })
+});
 
-  if (!resp.ok) {
-    const text = json ? JSON.stringify(json) : await resp.text().catch(() => "");
-    throw new Error(`Shopify GraphQL HTTP ${resp.status}: ${text}`);
-  }
+const text = await res.text();
+let json;
+try { json = JSON.parse(text); } catch { json = { raw: text }; }
 
-  if (!json) throw new Error("Shopify GraphQL returned empty response");
-  if (json.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
-  }
-
-  return json.data;
+if (!res.ok) {
+const msg = `Shopify GraphQL HTTP ${res.status}: ${text}`;
+const err = new Error(msg);
+err.status = res.status;
+err.payload = json;
+throw err;
 }
 
-/* ------------------------------ HEALTHCHECK -------------------------------- */
+if (json?.errors?.length) {
+const err = new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors)}`);
+err.payload = json;
+throw err;
+}
 
-app.get("/health", (_req, res) => {
-  res.json({ ok: true });
+return json.data;
+}
+
+/* ---------- Draft Order creation ---------- */
+function getAnchorVariantGid(calculatorType) {
+return calculatorType === "skylight"
+? ANCHOR_VARIANT_GID_SKYLIGHT
+: ANCHOR_VARIANT_GID_DGU;
+}
+
+function labelForCalculatorType(calculatorType) {
+// ✅ ensure capitalised output (you asked for this)
+return calculatorType === "skylight" ? "Skylight" : "DGU";
+}
+
+function buildCalculatorSummaryLines(calculatorType, units) {
+// Keep this short but useful; shows on invoice / draft order details.
+const lines = [];
+lines.push(`${labelForCalculatorType(calculatorType)} Calculator`);
+
+const qtySum = Array.isArray(units)
+? units.reduce((s, u) => s + asNumber(u?.qty, 0), 0)
+: 0;
+
+if (qtySum) lines.push(`Total Units: ${qtySum}`);
+return lines;
+}
+
+// Build a readable description per unit for the draft order "custom" line item
+function buildUnitTitle(calculatorType, u) {
+if (calculatorType === "skylight") {
+// Use the same field names your skylight payload sends
+const strength = safeStr(u.unitStrength);
+const glazing = safeStr(u.glazing);
+const tint = safeStr(u.tint);
+const sc = safeStr(u.solarControl);
+const self = safeStr(u.selfCleaning);
+
+const w = asNumber(u.widthMm, 0);
+const h = asNumber(u.heightMm, 0);
+const extW = asNumber(u.extWidthMm, 0);
+const extH = asNumber(u.extHeightMm, 0);
+
+const bits = [
+"Bespoke Frameless Skylight",
+strength && `• ${strength}`,
+glazing && `• ${glazing}`,
+`• Internal ${h}×${w}mm`,
+(extH && extW) ? `• External ${extH}×${extW}mm` : "",
+tint ? `• Tint ${tint}` : "",
+sc ? `• Solar Control ${sc}` : "",
+self ? `• Self Cleaning ${self}` : ""
+].filter(Boolean);
+
+return bits.join(" ");
+}
+
+// DGU
+const outer = safeStr(u.outerGlass);
+const inner = safeStr(u.innerGlass);
+const cavity = safeStr(u.cavityWidth);
+const spacer = safeStr(u.spacer);
+const self = safeStr(u.selfCleaning);
+
+const w = asNumber(u.widthMm, 0);
+const h = asNumber(u.heightMm, 0);
+
+const bits = [
+"Bespoke Double Glazed Unit",
+outer ? `• Outer ${outer}` : "",
+inner ? `• Inner ${inner}` : "",
+cavity ? `• Cavity ${cavity}` : "",
+`• ${h}×${w}mm`,
+spacer ? `• Spacer ${spacer}` : "",
+self ? `• Self Cleaning ${self}` : ""
+].filter(Boolean);
+
+return bits.join(" ");
+}
+
+function buildCustomLineItems(calculatorType, units) {
+const items = [];
+if (!Array.isArray(units)) return items;
+
+units.forEach((u) => {
+const qty = Math.max(1, Math.min(100, asNumber(u?.qty, 1)));
+const unitPrice = asNumber(u?.unitPrice, 0);
+const lineTotal = asNumber(u?.lineTotal, unitPrice * qty);
+
+// Skip free/invalid items (you already guard this client-side, but keep safe)
+if (!(lineTotal > 0) || !(unitPrice > 0)) return;
+
+items.push({
+title: buildUnitTitle(calculatorType, u),
+quantity: qty,
+// DraftOrderCreate input uses originalUnitPrice / originalUnitPriceWithCurrency?
+// The safe & supported field is "originalUnitPrice" (Money).
+originalUnitPrice: unitPrice.toFixed(2),
+// Put extra info into "customAttributes" so the merchant can see it
+customAttributes: [
+{ key: "Calculator", value: labelForCalculatorType(calculatorType) },
+{ key: "Unit Price", value: moneyGBP(unitPrice) },
+{ key: "Line Total", value: moneyGBP(lineTotal) }
+]
+});
 });
 
-/* -------------------------------- CHECKOUT --------------------------------- */
-/**
- * Expected payload from calculators:
- * {
- *   calculatorType: "dgu" | "skylight",
- *   totalUnitsQty: number,
- *   units: [{ qty, unitPrice, lineTotal, ... }]
- * }
- *
- * Headers:
- * - X-RG-Timestamp: ms timestamp string
- * - X-RG-Signature: hex(HMAC_SHA256(secret, `${ts}.${rawBody}`))
- */
+return items;
+}
+
+const DRAFT_ORDER_CREATE = `
+mutation DraftOrderCreate($input: DraftOrderInput!) {
+draftOrderCreate(input: $input) {
+draftOrder {
+id
+invoiceUrl
+}
+userErrors {
+field
+message
+}
+}
+}
+`;
+
+/* ---------- Routes ---------- */
+app.get("/", (req, res) => {
+res.status(200).send("OK");
+});
+
 app.post("/checkout", async (req, res) => {
-  try {
-    const ts = String(req.header("X-RG-Timestamp") || "");
-    const sig = String(req.header("X-RG-Signature") || "");
-    const rawBody = String(req.rawBody || "");
+// 1) Verify signature
+const sig = verifySignedRequest(req);
+if (!sig.ok) {
+return res.status(401).json({ error: "Unauthorized", reason: sig.reason });
+}
 
-    if (!ts || !sig || !rawBody) {
-      return res.status(400).json({ error: "Bad Request", reason: "Missing signature headers or body" });
-    }
+try {
+const body = req.body || {};
+const calculatorType = normalizeCalculatorType(body.calculatorType);
+const units = Array.isArray(body.units) ? body.units : [];
 
-    // Optional replay window (10 mins)
-    const now = Date.now();
-    const tsNum = Number(ts);
-    if (!Number.isFinite(tsNum) || Math.abs(now - tsNum) > 10 * 60 * 1000) {
-      return res.status(401).json({ error: "Unauthorized", reason: "Timestamp out of range" });
-    }
+// ✅ grandTotal: prefer client, fallback to sum(lineTotal)
+const computedGrandTotal = calcGrandTotalFromUnits(units);
+const grandTotal = asNumber(body.grandTotal, computedGrandTotal);
 
-    const expected = hmacHex(FRONTEND_SHARED_SECRET, `${ts}.${rawBody}`);
-    if (!timingSafeEqualHex(expected, sig)) {
-      return res.status(401).json({ error: "Unauthorized", reason: "Invalid signature" });
-    }
+const totalUnitsQty = asNumber(body.totalUnitsQty, units.reduce((s, u) => s + asNumber(u?.qty, 0), 0));
 
-    const body = req.body || {};
-    const calculatorType = String(body.calculatorType || "").toLowerCase();
-    const units = Array.isArray(body.units) ? body.units : [];
+// 2) Anchor line item (variant) to force product image/title in checkout
+const anchorVariantId = getAnchorVariantGid(calculatorType);
 
-    if (!["dgu", "skylight"].includes(calculatorType)) {
-      return res.status(400).json({ error: "Bad Request", reason: "Invalid calculatorType" });
-    }
-    if (units.length === 0) {
-      return res.status(400).json({ error: "Bad Request", reason: "No units provided" });
-    }
+// 3) Custom line items for each unit
+const customLineItems = buildCustomLineItems(calculatorType, units);
 
-    // Compute totals (server is source of truth)
-    const grandTotal = calcGrandTotalFromUnits(units);
-    const totalUnitsQty = clamp(safeNum(body.totalUnitsQty, 0), 0, 9999);
+// If nothing priced, fail fast
+if (customLineItems.length === 0) {
+return res.status(400).json({ error: "No priced units to checkout" });
+}
 
-    if (!(grandTotal > 0)) {
-      return res.status(400).json({ error: "Bad Request", reason: "Grand total is zero" });
-    }
+// 4) Persist calculator meta to draft order
+const summaryLines = buildCalculatorSummaryLines(calculatorType, units);
 
-    // Choose correct anchor variant so CHECKOUT shows correct product image
-    const anchorVariantId =
-      calculatorType === "dgu" ? DGU_ANCHOR_VARIANT_GID : SKYLIGHT_ANCHOR_VARIANT_GID;
+// ✅ capitalised outputs
+const attributes = [
+{ key: "Calculator Type", value: labelForCalculatorType(calculatorType) },
+{ key: "Grand Total", value: moneyGBP(grandTotal) }, // ✅ THIS IS THE CHANGE YOU ASKED FOR
+{ key: "Total Units", value: String(totalUnitsQty) }
+];
 
-    // Title (capitalised – fixes “Calculator” formatting)
-    const checkoutTitle =
-      calculatorType === "dgu" ? "Bespoke Glazed Unit Calculator" : "Bespoke Frameless Skylight Calculator";
+// 5) Draft order input
+const input = {
+// NOTE: Keep the draft order open for invoice/checkout
+// status: "OPEN", // Shopify sets status; not always accepted here
+note: `${summaryLines.join(" • ")} • Grand Total: ${moneyGBP(grandTotal)}`, // ✅ shows in admin; often on invoice
+customAttributes: attributes,
 
-    // Build a compact note with key totals
-    const noteLines = [
-      checkoutTitle,
-      `Total Units (Qty): ${totalUnitsQty || units.reduce((s, u) => s + safeNum(u?.qty, 0), 0)}`,
-      `Grand Total: £${money2(grandTotal)}`,
-      "",
-      "Units:",
-    ];
+// Line items: anchor variant first, then custom items
+lineItems: [
+{
+variantId: anchorVariantId,
+quantity: 1
+// Price will come from variant; your server can override via appliedDiscount if needed
+},
+...customLineItems
+]
+};
 
-    units.forEach((u, i) => {
-      const qty = clamp(safeNum(u?.qty, 1), 1, 10);
-      const unitPrice = safeNum(u?.unitPrice, 0);
-      const lineTotal = safeNum(u?.lineTotal, unitPrice * qty);
-      const w = u?.widthMm ?? u?.w;
-      const h = u?.heightMm ?? u?.h;
+const data = await shopifyGraphQL(DRAFT_ORDER_CREATE, { input });
+const result = data?.draftOrderCreate;
 
-      // Keep it readable in Shopify admin
-      noteLines.push(
-        `#${i + 1} × ${qty} | Unit £${money2(unitPrice)} | Line £${money2(lineTotal)} | ${w ?? "?"}mm × ${h ?? "?"}mm`
-      );
-    });
+const userErrors = result?.userErrors || [];
+if (userErrors.length) {
+return res.status(400).json({
+error: "Shopify error",
+reason: userErrors.map(e => e.message).join(" | "),
+userErrors
+});
+}
 
-    // Store the detailed payload as a string in note too (truncated)
-    const rawPayloadString = JSON.stringify(
-      { calculatorType, totalUnitsQty, grandTotal: money2(grandTotal), units },
-      null,
-      0
-    );
-    noteLines.push("");
-    noteLines.push("Payload:");
-    noteLines.push(rawPayloadString.slice(0, 3500));
+const invoiceUrl = result?.draftOrder?.invoiceUrl;
+if (!invoiceUrl) {
+return res.status(500).json({ error: "Checkout created but invoiceUrl missing" });
+}
 
-    const note = noteLines.join("\n");
+return res.status(200).json({ invoiceUrl });
+} catch (err) {
+console.error(err);
 
-    /**
-     * IMPORTANT:
-     * This is the key fix for your issues:
-     * - GRAND TOTAL not pulling through -> we override the anchor line item price to GRAND TOTAL
-     * - PRODUCT PICTURE not pulling through -> we use an anchor VARIANT line item (image comes from product)
-     *
-     * So checkout shows:
-     * - Your skylight (or DGU) product image
-     * - Price = calculator grand total
-     */
-    const lineItemAttributes = [
-      { key: "Calculator Type", value: calculatorType.toUpperCase() },
-      { key: "Order Total", value: `£${money2(grandTotal)}` },
-      { key: "Total Units Qty", value: String(totalUnitsQty || "") },
-      { key: "Breakdown", value: rawPayloadString.slice(0, 500) }, // short (Shopify UI friendly)
-    ];
+// Make Shopify auth issues obvious
+const msg = String(err?.message || "Server error");
+if (msg.includes("Invalid API key") || msg.includes("access token") || msg.includes("401")) {
+return res.status(500).json({
+error: "Shopify auth error",
+reason: msg
+});
+}
 
-    const mutation = /* GraphQL */ `
-      mutation DraftOrderCreate($input: DraftOrderInput!) {
-        draftOrderCreate(input: $input) {
-          draftOrder {
-            id
-            invoiceUrl
-            status
-          }
-          userErrors {
-            field
-            message
-          }
-        }
-      }
-    `;
-
-    const variables = {
-      input: {
-        note,
-        tags: [`RG-${calculatorType.toUpperCase()}`, "Calculator"],
-        // A single anchor line item priced to the grand total:
-        lineItems: [
-          {
-            variantId: anchorVariantId,
-            quantity: 1,
-            // Override price so the checkout total matches calculator total
-            originalUnitPrice: money2(grandTotal),
-            customAttributes: lineItemAttributes,
-          },
-        ],
-        // Also store summary attributes on the draft order itself (shows in Admin)
-        customAttributes: [
-          { key: "Calculator", value: checkoutTitle },
-          { key: "Calculator Type", value: calculatorType.toUpperCase() },
-          { key: "Grand Total", value: `£${money2(grandTotal)}` },
-          { key: "Total Units Qty", value: String(totalUnitsQty || "") },
-        ],
-      },
-    };
-
-    const data = await shopifyGraphQL(mutation, variables);
-
-    const out = data?.draftOrderCreate;
-    const userErrors = out?.userErrors || [];
-    if (userErrors.length) {
-      return res.status(400).json({ error: "Shopify error", reason: userErrors.map((e) => e.message).join(" | ") });
-    }
-
-    const draftOrder = out?.draftOrder;
-    const invoiceUrl = draftOrder?.invoiceUrl;
-
-    if (!invoiceUrl) {
-      return res.status(500).json({ error: "Checkout created but invoice URL missing" });
-    }
-
-    return res.json({
-      ok: true,
-      invoiceUrl,
-      calculatorType,
-      grandTotal: money2(grandTotal),
-    });
-  } catch (err) {
-    console.error(err);
-    return res.status(500).json({
-      error: "Server error",
-      reason: err?.message || String(err),
-    });
-  }
+return res.status(500).json({ error: "Server error", reason: msg });
+}
 });
 
-/* --------------------------------- START ---------------------------------- */
-
-const PORT = Number(process.env.PORT) || 3000;
+/* ---------- Start ---------- */
+const PORT = asNumber(process.env.PORT, 3000);
 app.listen(PORT, () => {
-  console.log(`RightGlaze checkout server listening on port ${PORT}`);
-  console.log(`Shop: ${SHOPIFY_SHOP_DOMAIN} | API: ${SHOPIFY_API_VERSION}`);
+console.log(`Server listening on port ${PORT}`);
+console.log(`Shop domain: ${SHOP_DOMAIN}`);
 });
