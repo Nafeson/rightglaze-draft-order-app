@@ -22,7 +22,7 @@ const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
-// Optional
+// Optional: comma-separated list of allowed origins
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || "")
   .split(",")
   .map(s => s.trim())
@@ -133,17 +133,15 @@ async function shopifyGraphql(query, variables) {
   try {
     json = JSON.parse(text);
   } catch {
-    // This is useful when Shopify/WAF returns HTML
     throw new Error(`Shopify GraphQL non-JSON response (HTTP ${res.status}): ${text.slice(0, 300)}`);
   }
 
   if (!res.ok) {
-    // Include response payload in error (truncated)
     throw new Error(`Shopify GraphQL HTTP ${res.status}: ${text.slice(0, 800)}`);
   }
 
   if (json.errors?.length) {
-    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors).slice(0, 1000)}`);
+    throw new Error(`Shopify GraphQL errors: ${JSON.stringify(json.errors).slice(0, 2000)}`);
   }
 
   return json.data;
@@ -205,7 +203,6 @@ function titleForUnit(calculatorType, u) {
 
 function buildDraftOrderLineItems({ calculatorType, units }) {
   const anchorVariantId = pickAnchorVariant(calculatorType);
-
   const items = [];
 
   // Anchor item -> forces product image/title in checkout
@@ -230,15 +227,13 @@ function buildDraftOrderLineItems({ calculatorType, units }) {
 }
 
 // =====================
-// CHECKOUT ENDPOINT (RAW)
+// CHECKOUT ENDPOINT
 // =====================
 app.post("/checkout", async (req, res) => {
   const reqId = crypto.randomUUID();
 
   try {
-    // req.body is a Buffer because of express.raw()
     const parsed = parseJsonRaw(req.body);
-
     if (!parsed.ok) {
       console.error(`[${reqId}] Bad JSON body`, parsed.message);
       return res.status(400).json({ error: "Bad JSON", reason: parsed.error, reqId });
@@ -253,7 +248,7 @@ app.post("/checkout", async (req, res) => {
     const ok = verifyHmac({
       secret: FRONTEND_SHARED_SECRET,
       timestamp,
-      rawBody,               // ✅ EXACT string browser signed
+      rawBody,
       signatureHex: signature,
     });
 
@@ -275,11 +270,15 @@ app.post("/checkout", async (req, res) => {
 
     const lineItems = buildDraftOrderLineItems({ calculatorType, units });
 
-    const noteAttributes = [
-      { name: "Calculator Type", value: String(calculatorType) },
-      { name: "Total Units Qty", value: String(totalUnitsQty) },
-      { name: "Grand Total", value: `£${grandTotal.toFixed(2)}` },
+    // ✅ FIX: DraftOrderInput does NOT support noteAttributes.
+    // Persist metadata into the draft order note string (always supported).
+    const noteLines = [
+      "Created via RightGlaze calculator checkout",
+      `Calculator Type: ${String(calculatorType)}`,
+      `Total Units Qty: ${String(totalUnitsQty)}`,
+      `Grand Total: £${grandTotal.toFixed(2)}`,
     ];
+    const note = noteLines.join("\n");
 
     const mutation = `
       mutation DraftOrderCreate($input: DraftOrderInput!) {
@@ -291,9 +290,11 @@ app.post("/checkout", async (req, res) => {
     `;
 
     const input = {
-      note: "Created via RightGlaze calculator checkout",
-      noteAttributes,
-      tags: [`calculator:${String(calculatorType).toLowerCase()}`],
+      note,
+      tags: [
+        `calculator:${String(calculatorType).toLowerCase()}`,
+        `units:${String(totalUnitsQty)}`,
+      ],
       lineItems,
     };
 
@@ -327,8 +328,6 @@ app.post("/checkout", async (req, res) => {
     return res.status(200).json({ invoiceUrl, draftOrderId, reqId });
   } catch (err) {
     console.error(`[${reqId}] Server error`, err);
-
-    // Return something useful to the frontend (no secrets)
     return res.status(500).json({
       error: "Server error",
       message: err?.message || String(err),
