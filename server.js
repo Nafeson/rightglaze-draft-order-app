@@ -15,9 +15,7 @@ ENV
 ========================= */
 function mustEnv(name) {
 const v = process.env[name];
-if (!v || !String(v).trim()) {
-throw new Error(`Missing required env var: ${name}`);
-}
+if (!v || !String(v).trim()) throw new Error(`Missing required env var: ${name}`);
 return String(v).trim();
 }
 
@@ -28,8 +26,7 @@ const FRONTEND_SHARED_SECRET = mustEnv("FRONTEND_SHARED_SECRET");
 const ANCHOR_VARIANT_GID_DGU = mustEnv("ANCHOR_VARIANT_GID_DGU");
 const ANCHOR_VARIANT_GID_SKYLIGHT = mustEnv("ANCHOR_VARIANT_GID_SKYLIGHT");
 
-const PRESENTMENT_CURRENCY_CODE =
-(process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
+const PRESENTMENT_CURRENCY_CODE = (process.env.PRESENTMENT_CURRENCY_CODE || "GBP").trim();
 
 /* =========================
 RAW BODY (HMAC)
@@ -48,7 +45,6 @@ CORS (MANUAL)
 ========================= */
 app.use((req, res, next) => {
 const origin = req.headers.origin || "*";
-
 res.setHeader("Access-Control-Allow-Origin", origin);
 res.setHeader("Vary", "Origin");
 res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
@@ -57,10 +53,7 @@ res.setHeader(
 "Content-Type, X-RG-Timestamp, X-RG-Signature"
 );
 
-if (req.method === "OPTIONS") {
-return res.status(204).end();
-}
-
+if (req.method === "OPTIONS") return res.status(204).end();
 next();
 });
 
@@ -74,14 +67,11 @@ return crypto.createHmac("sha256", secret).update(msg).digest("hex");
 function requireValidSignature(req) {
 const ts = req.header("X-RG-Timestamp");
 const sig = req.header("X-RG-Signature");
-
 if (!ts || !sig) throw new Error("Missing signature headers");
 
 const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, `${ts}.${req.rawBody}`);
 
-if (
-!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))
-) {
+if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) {
 throw new Error("Invalid signature");
 }
 }
@@ -96,7 +86,7 @@ currencyCode: PRESENTMENT_CURRENCY_CODE,
 
 const fmtGBP = (n) => `£${Number(n || 0).toFixed(2)}`;
 
-// Width × Height formatter (as requested)
+// DGU wants W×H (unchanged)
 function dimsWH(w, h) {
 const ww = Number(w);
 const hh = Number(h);
@@ -104,8 +94,23 @@ if (Number.isFinite(ww) && Number.isFinite(hh)) return `${ww}mm × ${hh}mm`;
 return "—";
 }
 
+// Skylight wants H×W
+function dimsHW(h, w) {
+const hh = Number(h);
+const ww = Number(w);
+if (Number.isFinite(hh) && Number.isFinite(ww)) return `${hh}mm × ${ww}mm`;
+return "—";
+}
+
 const grandTotalFromUnits = (units) =>
 units.reduce((sum, u) => sum + (Number(u.lineTotal) || 0), 0);
+
+function pushAttr(arr, key, value) {
+if (value === undefined || value === null) return;
+const v = String(value).trim();
+if (!v) return;
+arr.push({ key, value: v });
+}
 
 /* =========================
 SUMMARY BUILDERS
@@ -113,39 +118,55 @@ SUMMARY BUILDERS
 function buildDguAttributes(u) {
 const a = [];
 
-// Keep DGU summary logic/order as-is aside from removing Line Total
+// Size first (existing behaviour)
 const w = u.widthMm ?? u.w;
 const h = u.heightMm ?? u.h;
-
 a.push({ key: "Size", value: dimsWH(w, h) });
-a.push({ key: "Outer Glass", value: u.outerGlass });
-a.push({ key: "Inner Glass", value: u.innerGlass });
 
-if (u.qty > 1) {
+// Show all option inputs from DGU calculator
+pushAttr(a, "Calculator", "DGU");
+pushAttr(a, "Outer Glass", u.outerGlass);
+pushAttr(a, "Inner Glass", u.innerGlass);
+pushAttr(a, "Cavity Width", u.cavityWidth);
+
+// Toughened is always Yes for DGU calculator
+pushAttr(a, "Toughened", u.toughened ?? "Yes");
+
+pushAttr(a, "Self-cleaning", u.selfCleaning);
+pushAttr(a, "Spacer", u.spacer);
+
+// Optional: include thickness if payload includes it
+// (won't show if undefined)
+pushAttr(a, "Thickness", u.thickness);
+
+// Unit price + line total only if qty > 1
+if (Number(u.qty) > 1) {
 a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
+a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
 }
 
-// ✅ CHANGE: do NOT include Line Total in summary
 return a;
 }
 
 function buildSkylightAttributes(u) {
 const a = [];
 
-// ✅ Internal must pull through and be width × height
+// Pull internal dims from payload (internal is widthMm/heightMm) but DISPLAY as H×W
 const internalW = u.widthMm ?? u.w;
 const internalH = u.heightMm ?? u.h;
 
-// ✅ External must match the red popup output (same ext dims your calculator computes)
-// Prefer extWidthMm/extHeightMm from payload; fall back to extW/extH
+// Pull external dims from payload (must match red popup) but DISPLAY as H×W
 const externalW = u.extWidthMm ?? u.extW;
 const externalH = u.extHeightMm ?? u.extH;
 
 a.push({ key: "Calculator", value: "Skylight" });
-a.push({ key: "Internal", value: dimsWH(internalW, internalH) });
-a.push({ key: "Unit Strength", value: u.unitStrength });
-a.push({ key: "Glazing", value: u.glazing });
-a.push({ key: "Tint", value: u.tint });
+
+// Internal: height first then width
+a.push({ key: "Internal", value: dimsHW(internalH, internalW) });
+
+pushAttr(a, "Unit Strength", u.unitStrength);
+pushAttr(a, "Glazing", u.glazing);
+pushAttr(a, "Tint", u.tint);
 
 if (String(u.solarControl).toLowerCase() === "yes") {
 a.push({ key: "Solar Control", value: "Yes" });
@@ -155,15 +176,18 @@ if (String(u.selfCleaning).toLowerCase() === "yes") {
 a.push({ key: "Self Cleaning", value: "Yes" });
 }
 
-if (u.qty > 1) {
+// Unit price + line total only if qty > 1
+if (Number(u.qty) > 1) {
 a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
+a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
 }
 
-// ✅ CHANGE: do NOT include Line Total in summary
-
-// ✅ External must be LAST
-if (Number.isFinite(Number(externalW)) && Number.isFinite(Number(externalH))) {
-a.push({ key: "External", value: dimsWH(externalW, externalH) });
+// External LAST: height first then width
+if (
+Number.isFinite(Number(externalW)) &&
+Number.isFinite(Number(externalH))
+) {
+a.push({ key: "External", value: dimsHW(externalH, externalW) });
 }
 
 return a;
@@ -187,9 +211,8 @@ body: JSON.stringify({ query, variables }),
 
 const json = await res.json();
 if (!res.ok || json.errors) {
-throw new Error(JSON.stringify(json.errors));
+throw new Error(JSON.stringify(json.errors || json));
 }
-
 return json.data;
 }
 
@@ -201,20 +224,19 @@ try {
 requireValidSignature(req);
 
 const { calculatorType, units, totalUnitsQty } = req.body;
-if (!units || !units.length) throw new Error("No units provided");
+if (!units || !Array.isArray(units) || units.length === 0) {
+throw new Error("No units provided");
+}
 
 const isSkylight = calculatorType === "skylight";
-const variantId = isSkylight
-? ANCHOR_VARIANT_GID_SKYLIGHT
-: ANCHOR_VARIANT_GID_DGU;
+const variantId = isSkylight ? ANCHOR_VARIANT_GID_SKYLIGHT : ANCHOR_VARIANT_GID_DGU;
 
 const lineItems = units.map((u) => ({
 variantId,
-quantity: u.qty,
+quantity: Number(u.qty) || 1,
+// per-unit price (Shopify calculates totals)
 priceOverride: money(u.unitPrice),
-customAttributes: isSkylight
-? buildSkylightAttributes(u)
-: buildDguAttributes(u),
+customAttributes: isSkylight ? buildSkylightAttributes(u) : buildDguAttributes(u),
 }));
 
 const grandTotal = grandTotalFromUnits(units);
@@ -224,8 +246,8 @@ note: "Created via RightGlaze calculator checkout",
 tags: [`calculator:${calculatorType}`],
 presentmentCurrencyCode: PRESENTMENT_CURRENCY_CODE,
 customAttributes: [
-{ key: "Calculator Type", value: calculatorType },
-{ key: "Total Units Qty", value: String(totalUnitsQty) },
+{ key: "Calculator Type", value: String(calculatorType || "").trim() },
+{ key: "Total Units Qty", value: String(totalUnitsQty ?? "") },
 { key: "Grand Total", value: fmtGBP(grandTotal) },
 ],
 lineItems,
@@ -241,17 +263,19 @@ userErrors { message }
 { input }
 );
 
-const out = data.draftOrderCreate;
-if (out.userErrors.length) {
-throw new Error(out.userErrors[0].message);
-}
+const out = data?.draftOrderCreate;
+if (!out) throw new Error("Unexpected Shopify response");
+if (out.userErrors?.length) throw new Error(out.userErrors[0].message);
 
-res.json({ invoiceUrl: out.draftOrder.invoiceUrl });
+const invoiceUrl = out.draftOrder?.invoiceUrl;
+if (!invoiceUrl) throw new Error("Checkout created but invoice URL missing.");
+
+res.json({ invoiceUrl });
 } catch (err) {
 console.error(err);
 res.status(500).json({
 error: "Server error",
-reason: String(err.message || err),
+reason: String(err?.message || err),
 });
 }
 });
