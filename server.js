@@ -71,11 +71,9 @@ if (!ts || !sig) throw new Error("Missing signature headers");
 
 const expected = hmacSha256Hex(FRONTEND_SHARED_SECRET, `${ts}.${req.rawBody}`);
 
-// timingSafeEqual requires same length buffers
-const a = Buffer.from(expected, "utf8");
-const b = Buffer.from(String(sig), "utf8");
-if (a.length !== b.length) throw new Error("Invalid signature");
-if (!crypto.timingSafeEqual(a, b)) throw new Error("Invalid signature");
+if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(sig))) {
+throw new Error("Invalid signature");
+}
 }
 
 /* =========================
@@ -115,12 +113,53 @@ arr.push({ key, value: v });
 }
 
 /* =========================
+DISCOUNT FORMATTER (NEW)
+========================= */
+function formatDiscount(u) {
+const pct =
+u.discountPercent ??
+u.discountPct ??
+u.discountRate ??
+u.discountPercentInt ??
+null;
+
+const saving =
+u.discountSaving ??
+u.discountSave ??
+u.discountAmount ??
+u.saving ??
+null;
+
+// If calculator sends a ready-made label, prefer it
+if (u.discountLabel && String(u.discountLabel).trim()) return String(u.discountLabel).trim();
+
+const pctNum = Number(pct);
+const savingNum = Number(saving);
+
+if (Number.isFinite(pctNum) && pctNum > 0 && Number.isFinite(savingNum) && savingNum > 0) {
+return `${pctNum}% saving ${fmtGBP(savingNum)}`;
+}
+
+// If only percent exists
+if (Number.isFinite(pctNum) && pctNum > 0) {
+return `${pctNum}% discount`;
+}
+
+// If only saving exists
+if (Number.isFinite(savingNum) && savingNum > 0) {
+return `Saving ${fmtGBP(savingNum)}`;
+}
+
+return "";
+}
+
+/* =========================
 SUMMARY BUILDERS
 ========================= */
 function buildDguAttributes(u) {
 const a = [];
 
-// Size first (existing behaviour) — DGU stays W×H
+// Size first (existing behaviour)
 const w = u.widthMm ?? u.w;
 const h = u.heightMm ?? u.h;
 a.push({ key: "Size", value: dimsWH(w, h) });
@@ -140,21 +179,18 @@ pushAttr(a, "Spacer", u.spacer);
 // Optional: include thickness if payload includes it
 pushAttr(a, "Thickness", u.thickness);
 
-// Unit price + line total only if qty > 1 (unchanged)
+// Unit price only if qty > 1 (NO line total)
 if (Number(u.qty) > 1) {
 a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
-a.push({ key: "Line Total", value: fmtGBP(u.lineTotal) });
 }
+
+// Keep Discount attribute if present (NO line total)
+const discountText = formatDiscount(u);
+if (discountText) a.push({ key: "Discount", value: discountText });
 
 return a;
 }
 
-/**
-* ✅ UPDATED for Skylight discount changes:
-* - Uses discounted unitPrice/lineTotal for pricing (Shopify priceOverride already does)
-* - Adds discount info + shows "Was £X.XX → Now £Y.YY" for Unit Price and Line Total when qty > 1
-* - Pulls baseUnitPrice/baseLineTotal/discountPct/discountSaving from the skylight calculator payload
-*/
 function buildSkylightAttributes(u) {
 const a = [];
 
@@ -183,39 +219,14 @@ if (String(u.selfCleaning).toLowerCase() === "yes") {
 a.push({ key: "Self Cleaning", value: "Yes" });
 }
 
-// ✅ Discount display (only when discountPct > 0)
-const qty = Number(u.qty) || 1;
-const discountPct = Number(u.discountPct) || 0;
-const discountSaving = Number(u.discountSaving) || 0;
-
-if (discountPct > 0 && discountSaving > 0) {
-const pctTxt = `${Math.round(discountPct * 100)}%`;
-a.push({ key: "Discount", value: `${pctTxt} (saving ${fmtGBP(discountSaving)})` });
+// Unit price only if qty > 1 (NO line total)
+if (Number(u.qty) > 1) {
+a.push({ key: "Unit Price", value: fmtGBP(u.unitPrice) });
 }
 
-// ✅ Show Unit Price + Line Total only if qty > 1
-// ✅ Show base (pre-discount) and discounted values
-if (qty > 1) {
-const baseUnit = Number(u.baseUnitPrice) || 0;
-const baseLine = Number(u.baseLineTotal) || 0;
-const discUnit = Number(u.unitPrice) || 0;
-const discLine = Number(u.lineTotal) || 0;
-
-// Checkout properties are plain text (no real strikethrough), so we show "Was → Now"
-a.push({
-key: "Unit Price",
-value: discountPct > 0 && baseUnit > 0
-? `Was ${fmtGBP(baseUnit)} → Now ${fmtGBP(discUnit)}`
-: fmtGBP(discUnit),
-});
-
-a.push({
-key: "Line Total",
-value: discountPct > 0 && baseLine > 0
-? `Was ${fmtGBP(baseLine)} → Now ${fmtGBP(discLine)}`
-: fmtGBP(discLine),
-});
-}
+// Keep Discount attribute if present (NO line total)
+const discountText = formatDiscount(u);
+if (discountText) a.push({ key: "Discount", value: discountText });
 
 // External LAST: height first then width
 if (Number.isFinite(Number(externalW)) && Number.isFinite(Number(externalH))) {
@@ -266,7 +277,7 @@ const variantId = isSkylight ? ANCHOR_VARIANT_GID_SKYLIGHT : ANCHOR_VARIANT_GID_
 const lineItems = units.map((u) => ({
 variantId,
 quantity: Number(u.qty) || 1,
-// per-unit price (must be DISCOUNTED per-unit price for skylight)
+// per-unit price (should already be DISCOUNTED by the calculator payload)
 priceOverride: money(u.unitPrice),
 customAttributes: isSkylight ? buildSkylightAttributes(u) : buildDguAttributes(u),
 }));
